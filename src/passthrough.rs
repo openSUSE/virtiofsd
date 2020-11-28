@@ -58,6 +58,42 @@ struct LinuxDirent64 {
 }
 unsafe impl ByteValued for LinuxDirent64 {}
 
+// Iterates over directory entries from a buffer
+struct LinuxDirent64Iter<'a>(&'a [u8]);
+
+impl<'a> Iterator for LinuxDirent64Iter<'a> {
+    // The directory entry metadata and the entry name
+    type Item = (&'a LinuxDirent64, &'a [u8]);
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.0.is_empty() {
+            return None;
+        }
+
+        // We only use debug asserts here because these values are coming from the kernel and we
+        // trust them implicitly.
+        debug_assert!(
+            self.0.len() >= size_of::<LinuxDirent64>(),
+            "not enough space left in `self`"
+        );
+
+        let (front, back) = self.0.split_at(size_of::<LinuxDirent64>());
+        let dirent64 =
+            LinuxDirent64::from_slice(front).expect("unable to get LinuxDirent64 from slice");
+        debug_assert!(
+            self.0.len() >= dirent64.d_reclen as usize,
+            "`self` is smaller than `d_reclen`"
+        );
+
+        let namelen = dirent64.d_reclen as usize - size_of::<LinuxDirent64>();
+        debug_assert!(namelen <= back.len(), "back is smaller than `namelen`");
+
+        let (name, back) = back.split_at(namelen);
+        self.0 = back;
+
+        Some((dirent64, name))
+    }
+}
+
 macro_rules! scoped_cred {
     ($name:ident, $ty:ty, $syscall_nr:expr) => {
         #[derive(Debug)]
@@ -507,46 +543,20 @@ impl PassthroughFs {
             mem::drop(dir);
         }
 
-        let mut rem = &buf[..];
-        while !rem.is_empty() {
-            // We only use debug asserts here because these values are coming from the kernel and we
-            // trust them implicitly.
-            debug_assert!(
-                rem.len() >= size_of::<LinuxDirent64>(),
-                "not enough space left in `rem`"
-            );
+        for (dirent64, name) in LinuxDirent64Iter(&buf[..]) {
+            // We don't want to report the "." and ".." entries.
+            if name.starts_with(CURRENT_DIR_CSTR) || name.starts_with(PARENT_DIR_CSTR) {
+                continue;
+            }
 
-            let (front, back) = rem.split_at(size_of::<LinuxDirent64>());
-
-            let dirent64 =
-                LinuxDirent64::from_slice(front).expect("unable to get LinuxDirent64 from slice");
-
-            let namelen = dirent64.d_reclen as usize - size_of::<LinuxDirent64>();
-            debug_assert!(namelen <= back.len(), "back is smaller than `namelen`");
-
-            let name = &back[..namelen];
-            let res = if name.starts_with(CURRENT_DIR_CSTR) || name.starts_with(PARENT_DIR_CSTR) {
-                // We don't want to report the "." and ".." entries. However, returning `Ok(0)` will
-                // break the loop so return `Ok` with a non-zero value instead.
-                Ok(1)
-            } else {
-                add_entry(DirEntry {
-                    ino: dirent64.d_ino,
-                    offset: dirent64.d_off as u64,
-                    type_: u32::from(dirent64.d_ty),
-                    name,
-                })
-            };
-
-            debug_assert!(
-                rem.len() >= dirent64.d_reclen as usize,
-                "rem is smaller than `d_reclen`"
-            );
-
-            match res {
-                Ok(0) => break,
-                Ok(_) => rem = &rem[dirent64.d_reclen as usize..],
-                Err(e) => return Err(e),
+            if add_entry(DirEntry {
+                ino: dirent64.d_ino,
+                offset: dirent64.d_off as u64,
+                type_: u32::from(dirent64.d_ty),
+                name,
+            })? == 0
+            {
+                break;
             }
         }
 
