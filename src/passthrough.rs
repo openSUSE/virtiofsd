@@ -4,26 +4,25 @@
 
 use super::fs_cache_req_handler::FsCacheReqHandler;
 use crate::filesystem::{
-    Context, DirEntry, Entry, FileSystem, FsOptions, GetxattrReply, ListxattrReply, OpenOptions,
-    SetattrValid, ZeroCopyReader, ZeroCopyWriter,
+    Context, DirEntry, DirIterItemPlus, DirIterItemPlusDyn, DirectoryIterator, DirectoryIterators,
+    Entry, FileSystem, FsOptions, GetxattrReply, ListxattrReply, OpenOptions, SetattrValid,
+    ZeroCopyReader, ZeroCopyWriter,
 };
 use crate::fuse;
 use crate::multikey::MultikeyBTreeMap;
+use crate::read_dir::ReadDir;
 use std::collections::btree_map;
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io;
-use std::mem::{self, size_of, MaybeUninit};
+use std::mem::MaybeUninit;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use vm_memory::ByteValued;
 
-const CURRENT_DIR_CSTR: &[u8] = b".\0";
-const PARENT_DIR_CSTR: &[u8] = b"..\0";
 const EMPTY_CSTR: &[u8] = b"\0";
 const PROC_CSTR: &[u8] = b"/proc/self/fd\0";
 
@@ -46,52 +45,6 @@ struct InodeData {
 struct HandleData {
     inode: Inode,
     file: RwLock<File>,
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy, Debug, Default)]
-struct LinuxDirent64 {
-    d_ino: libc::ino64_t,
-    d_off: libc::off64_t,
-    d_reclen: libc::c_ushort,
-    d_ty: libc::c_uchar,
-}
-unsafe impl ByteValued for LinuxDirent64 {}
-
-// Iterates over directory entries from a buffer
-struct LinuxDirent64Iter<'a>(&'a [u8]);
-
-impl<'a> Iterator for LinuxDirent64Iter<'a> {
-    // The directory entry metadata and the entry name
-    type Item = (&'a LinuxDirent64, &'a [u8]);
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.0.is_empty() {
-            return None;
-        }
-
-        // We only use debug asserts here because these values are coming from the kernel and we
-        // trust them implicitly.
-        debug_assert!(
-            self.0.len() >= size_of::<LinuxDirent64>(),
-            "not enough space left in `self`"
-        );
-
-        let (front, back) = self.0.split_at(size_of::<LinuxDirent64>());
-        let dirent64 =
-            LinuxDirent64::from_slice(front).expect("unable to get LinuxDirent64 from slice");
-        debug_assert!(
-            self.0.len() >= dirent64.d_reclen as usize,
-            "`self` is smaller than `d_reclen`"
-        );
-
-        let namelen = dirent64.d_reclen as usize - size_of::<LinuxDirent64>();
-        debug_assert!(namelen <= back.len(), "back is smaller than `namelen`");
-
-        let (name, back) = back.split_at(namelen);
-        self.0 = back;
-
-        Some((dirent64, name))
-    }
 }
 
 macro_rules! scoped_cred {
@@ -325,6 +278,82 @@ pub struct PassthroughFs {
     cfg: Config,
 }
 
+/// The DirectoryIterators marker type.
+pub struct DirIters;
+
+impl<'b, 'f> DirectoryIterators<'f> for DirIters {
+    type Iter = ReadDir;
+    type IterPlus = DirIterPlus<'f>;
+    type IterPlusDyn = DirIterPlusDyn<'f>;
+
+    fn iter_to_dyn(iter: Self::Iter) -> Self::IterPlusDyn {
+        DirIterPlusDyn { plus: None, iter }
+    }
+    fn iter_plus_to_dyn(iter: Self::IterPlus) -> Self::IterPlusDyn {
+        DirIterPlusDyn {
+            plus: Some((iter.fs, iter.inode)),
+            iter: iter.iter,
+        }
+    }
+}
+
+pub struct DirIterPlus<'f> {
+    fs: &'f PassthroughFs,
+    inode: Inode,
+    iter: ReadDir,
+}
+
+pub struct DirIterPlusDyn<'f> {
+    plus: Option<(&'f PassthroughFs, Inode)>,
+    iter: ReadDir,
+}
+fn read_plus<'a>(
+    fs: &PassthroughFs,
+    inode: Inode,
+    dir_entry: DirEntry<'a>,
+) -> io::Result<(DirEntry<'a>, Entry)> {
+    // Safe because the kernel guarantees that the buffer is nul-terminated. Additionally,
+    // the kernel will pad the name with '\0' bytes up to 8-byte alignment and there's no
+    // way for us to know exactly how many padding bytes there are. This would cause
+    // `CStr::from_bytes_with_nul` to return an error because it would think there are
+    // interior '\0' bytes. We trust the kernel to provide us with properly formatted data
+    // so we'll just skip the checks here.
+    let name = unsafe { CStr::from_bytes_with_nul_unchecked(dir_entry.name) };
+    let entry = fs.do_lookup(inode, name)?;
+
+    Ok((dir_entry, entry))
+}
+impl<'f> DirectoryIterator<'f> for DirIterPlus<'f> {
+    type Item = DirIterItemPlus;
+
+    fn next<'b, 's: 'b>(&'s mut self) -> Option<io::Result<(DirEntry<'b>, Entry)>>
+    where
+        'f: 's,
+    {
+        let (fs, inode) = (self.fs, self.inode);
+        self.iter
+            .next()
+            .map(|dir_entry| read_plus(fs, inode, dir_entry))
+    }
+}
+
+impl<'f> DirectoryIterator<'f> for DirIterPlusDyn<'f> {
+    type Item = DirIterItemPlusDyn;
+
+    fn next<'b, 's: 'b>(&'s mut self) -> Option<io::Result<(DirEntry<'b>, Option<Entry>)>>
+    where
+        'f: 's,
+    {
+        if let Some((fs, inode)) = self.plus {
+            self.iter.next().map(|dir_entry| {
+                read_plus(fs, inode, dir_entry).map(|(dir_entry, plus)| (dir_entry, Some(plus)))
+            })
+        } else {
+            self.iter.next().map(|dir_entry| Ok((dir_entry, None)))
+        }
+    }
+}
+
 impl PassthroughFs {
     pub fn new(cfg: Config) -> io::Result<PassthroughFs> {
         let fd = if let Some(fd) = cfg.proc_sfd_rawfd {
@@ -485,84 +514,6 @@ impl PassthroughFs {
         })
     }
 
-    fn do_readdir<F>(
-        &self,
-        inode: Inode,
-        handle: Handle,
-        size: u32,
-        offset: u64,
-        mut add_entry: F,
-    ) -> io::Result<()>
-    where
-        F: FnMut(DirEntry) -> io::Result<usize>,
-    {
-        if size == 0 {
-            return Ok(());
-        }
-
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .map(Arc::clone)
-            .ok_or_else(ebadf)?;
-
-        let mut buf = vec![0; size as usize];
-
-        {
-            // Since we are going to work with the kernel offset, we have to acquire the file lock
-            // for both the `lseek64` and `getdents64` syscalls to ensure that no other thread
-            // changes the kernel offset while we are using it.
-            let dir = data.file.write().unwrap();
-
-            // Safe because this doesn't modify any memory and we check the return value.
-            let res =
-                unsafe { libc::lseek64(dir.as_raw_fd(), offset as libc::off64_t, libc::SEEK_SET) };
-            if res < 0 {
-                return Err(io::Error::last_os_error());
-            }
-
-            // Safe because the kernel guarantees that it will only write to `buf` and we check the
-            // return value.
-            let res = unsafe {
-                libc::syscall(
-                    libc::SYS_getdents64,
-                    dir.as_raw_fd(),
-                    buf.as_mut_ptr() as *mut LinuxDirent64,
-                    size as libc::c_int,
-                )
-            };
-            if res < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            buf.resize(res as usize, 0);
-
-            // Explicitly drop the lock so that it's not held while we fill in the fuse buffer.
-            mem::drop(dir);
-        }
-
-        for (dirent64, name) in LinuxDirent64Iter(&buf[..]) {
-            // We don't want to report the "." and ".." entries.
-            if name.starts_with(CURRENT_DIR_CSTR) || name.starts_with(PARENT_DIR_CSTR) {
-                continue;
-            }
-
-            if add_entry(DirEntry {
-                ino: dirent64.d_ino,
-                offset: dirent64.d_off as u64,
-                type_: u32::from(dirent64.d_ty),
-                name,
-            })? == 0
-            {
-                break;
-            }
-        }
-
-        Ok(())
-    }
-
     fn do_open(&self, inode: Inode, flags: u32) -> io::Result<(Option<Handle>, OpenOptions)> {
         let file = RwLock::new(self.open_inode(inode, flags as i32)?);
 
@@ -679,6 +630,7 @@ fn forget_one(
 impl FileSystem for PassthroughFs {
     type Inode = Inode;
     type Handle = Handle;
+    type DirEntries = DirIters;
 
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
         let root = CString::new(self.cfg.root_dir.as_str()).expect("CString::new failed");
@@ -824,45 +776,50 @@ impl FileSystem for PassthroughFs {
         self.do_unlink(parent, name, libc::AT_REMOVEDIR)
     }
 
-    fn readdir<F>(
-        &self,
+    fn readdir<'f>(
+        &'f self,
         _ctx: Context,
-        inode: Inode,
-        handle: Handle,
+        inode: Self::Inode,
+        handle: Self::Handle,
         size: u32,
         offset: u64,
-        add_entry: F,
-    ) -> io::Result<()>
-    where
-        F: FnMut(DirEntry) -> io::Result<usize>,
-    {
-        self.do_readdir(inode, handle, size, offset, add_entry)
+    ) -> io::Result<ReadDir> {
+        Ok(if size == 0 {
+            ReadDir::default()
+        } else {
+            let data = self
+                .handles
+                .read()
+                .unwrap()
+                .get(&handle)
+                .filter(|hd| hd.inode == inode)
+                .map(Arc::clone)
+                .ok_or_else(ebadf)?;
+            ReadDir::new(
+                vec![0; size as usize],
+                // Since we are going to work with the kernel offset, we have to acquire the file
+                // lock for both the `lseek64` and `getdents64` syscalls to ensure that no other
+                // thread changes the kernel offset while we are using it.
+                data.file.write().unwrap(),
+                offset,
+            )?
+        })
     }
 
-    fn readdirplus<F>(
-        &self,
-        _ctx: Context,
+    fn readdirplus<'f>(
+        &'f self,
+        ctx: Context,
         inode: Inode,
         handle: Handle,
         size: u32,
         offset: u64,
-        mut add_entry: F,
-    ) -> io::Result<()>
-    where
-        F: FnMut(DirEntry, Entry) -> io::Result<usize>,
-    {
-        self.do_readdir(inode, handle, size, offset, |dir_entry| {
-            // Safe because the kernel guarantees that the buffer is nul-terminated. Additionally,
-            // the kernel will pad the name with '\0' bytes up to 8-byte alignment and there's no
-            // way for us to know exactly how many padding bytes there are. This would cause
-            // `CStr::from_bytes_with_nul` to return an error because it would think there are
-            // interior '\0' bytes. We trust the kernel to provide us with properly formatted data
-            // so we'll just skip the checks here.
-            let name = unsafe { CStr::from_bytes_with_nul_unchecked(dir_entry.name) };
-            let entry = self.do_lookup(inode, name)?;
-
-            add_entry(dir_entry, entry)
-        })
+    ) -> io::Result<DirIterPlus> {
+        self.readdir(ctx, inode, handle, size, offset)
+            .map(|iter| DirIterPlus {
+                fs: self,
+                inode,
+                iter,
+            })
     }
 
     fn open(

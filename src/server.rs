@@ -5,7 +5,7 @@
 use super::fs_cache_req_handler::FsCacheReqHandler;
 use crate::descriptor_utils::{Reader, Writer};
 use crate::filesystem::{
-    Context, DirEntry, Entry, FileSystem, GetxattrReply, ListxattrReply, ZeroCopyReader,
+    Context, DirectoryIterator, FileSystem, GetxattrReply, ListxattrReply, ZeroCopyReader,
     ZeroCopyWriter,
 };
 use crate::fuse::*;
@@ -985,40 +985,93 @@ impl<F: FileSystem + Sync> Server<F> {
         // Skip over enough bytes for the header.
         let mut cursor = w.split_at(size_of::<OutHeader>()).unwrap();
 
-        let res = if plus {
-            self.fs.readdirplus(
-                Context::from(in_header),
-                in_header.nodeid.into(),
-                fh.into(),
-                size,
-                offset,
-                |d, e| add_dirent(&mut cursor, size, d, Some(e)),
-            )
-        } else {
-            self.fs.readdir(
-                Context::from(in_header),
-                in_header.nodeid.into(),
-                fh.into(),
-                size,
-                offset,
-                |d| add_dirent(&mut cursor, size, d, None),
-            )
+        let res = self.fs.readdirplus_dyn(
+            plus,
+            Context::from(in_header),
+            in_header.nodeid.into(),
+            fh.into(),
+            size,
+            offset,
+        );
+        let mut res = match res {
+            Err(e) => return reply_error(e, in_header.unique, w),
+            Ok(v) => v,
         };
 
-        if let Err(e) = res {
-            reply_error(e, in_header.unique, w)
-        } else {
-            // Don't use `reply_ok` because we need to set a custom size length for the
-            // header.
-            let out = OutHeader {
-                len: (size_of::<OutHeader>() + cursor.bytes_written()) as u32,
-                error: 0,
-                unique: in_header.unique,
-            };
-
-            w.write_all(out.as_slice()).map_err(Error::EncodeMessage)?;
-            Ok(out.len as usize)
+        fn overflow() -> io::Error {
+            io::Error::from_raw_os_error(libc::EOVERFLOW)
         }
+        let max = size;
+        while let Some(entry) = res.next() {
+            let (d, entry) = match entry {
+                Err(e) => return reply_error(e, in_header.unique, w),
+                Ok(v) => v,
+            };
+            if d.name.len() > ::std::u32::MAX as usize {
+                return reply_error(overflow(), in_header.unique, w);
+            }
+            let dirent_len = if let Some(v) = size_of::<Dirent>().checked_add(d.name.len()) {
+                v
+            } else {
+                return reply_error(overflow(), in_header.unique, w);
+            };
+            // Directory entries must be padded to 8-byte alignment.  If adding 7 causes
+            // an overflow then this dirent cannot be properly padded.
+            let padded_dirent_len = if let Some(v) = dirent_len.checked_add(7).map(|l| l & !7) {
+                v
+            } else {
+                return reply_error(overflow(), in_header.unique, w);
+            };
+            let total_len = if entry.is_some() {
+                if let Some(v) = padded_dirent_len.checked_add(size_of::<EntryOut>()) {
+                    v
+                } else {
+                    return reply_error(overflow(), in_header.unique, w);
+                }
+            } else {
+                padded_dirent_len
+            };
+            if (max as usize).saturating_sub(cursor.bytes_written()) < total_len {
+                break;
+            } else {
+                if let Some(entry) = entry {
+                    if let Err(e) = cursor.write_all(EntryOut::from(entry).as_slice()) {
+                        return reply_error(e, in_header.unique, w);
+                    }
+                }
+                let dirent = Dirent {
+                    ino: d.ino,
+                    off: d.offset,
+                    namelen: d.name.len() as u32,
+                    type_: d.type_,
+                };
+                if let Err(e) = cursor.write_all(dirent.as_slice()) {
+                    return reply_error(e, in_header.unique, w);
+                }
+                if let Err(e) = cursor.write_all(d.name) {
+                    return reply_error(e, in_header.unique, w);
+                }
+                // We know that `dirent_len` <= `padded_dirent_len` due to the check above
+                // so there's no need for checked arithmetic.
+                let padding = padded_dirent_len - dirent_len;
+                if padding > 0 {
+                    if let Err(e) = cursor.write_all(&DIRENT_PADDING[..padding]) {
+                        return reply_error(e, in_header.unique, w);
+                    }
+                }
+            }
+        }
+
+        // Don't use `reply_ok` because we need to set a custom size length for the
+        // header.
+        let out = OutHeader {
+            len: (size_of::<OutHeader>() + cursor.bytes_written()) as u32,
+            error: 0,
+            unique: in_header.unique,
+        };
+
+        w.write_all(out.as_slice()).map_err(Error::EncodeMessage)?;
+        Ok(out.len as usize)
     }
 
     fn readdir(&self, in_header: InHeader, r: Reader, w: Writer) -> Result<usize> {
@@ -1359,61 +1412,4 @@ fn bytes_to_cstr(buf: &[u8]) -> Result<&CStr> {
     // Convert to a `CStr` first so that we can drop the '\0' byte at the end
     // and make sure there are no interior '\0' bytes.
     CStr::from_bytes_with_nul(buf).map_err(Error::InvalidCString)
-}
-
-fn add_dirent(
-    cursor: &mut Writer,
-    max: u32,
-    d: DirEntry,
-    entry: Option<Entry>,
-) -> io::Result<usize> {
-    if d.name.len() > ::std::u32::MAX as usize {
-        return Err(io::Error::from_raw_os_error(libc::EOVERFLOW));
-    }
-
-    let dirent_len = size_of::<Dirent>()
-        .checked_add(d.name.len())
-        .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
-
-    // Directory entries must be padded to 8-byte alignment.  If adding 7 causes
-    // an overflow then this dirent cannot be properly padded.
-    let padded_dirent_len = dirent_len
-        .checked_add(7)
-        .map(|l| l & !7)
-        .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
-
-    let total_len = if entry.is_some() {
-        padded_dirent_len
-            .checked_add(size_of::<EntryOut>())
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?
-    } else {
-        padded_dirent_len
-    };
-
-    if (max as usize).saturating_sub(cursor.bytes_written()) < total_len {
-        Ok(0)
-    } else {
-        if let Some(entry) = entry {
-            cursor.write_all(EntryOut::from(entry).as_slice())?;
-        }
-
-        let dirent = Dirent {
-            ino: d.ino,
-            off: d.offset,
-            namelen: d.name.len() as u32,
-            type_: d.type_,
-        };
-
-        cursor.write_all(dirent.as_slice())?;
-        cursor.write_all(d.name)?;
-
-        // We know that `dirent_len` <= `padded_dirent_len` due to the check above
-        // so there's no need for checked arithmetic.
-        let padding = padded_dirent_len - dirent_len;
-        if padding > 0 {
-            cursor.write_all(&DIRENT_PADDING[..padding])?;
-        }
-
-        Ok(total_len)
-    }
 }

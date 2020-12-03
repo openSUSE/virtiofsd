@@ -12,6 +12,7 @@ pub mod fs_cache_req_handler;
 pub mod fuse;
 pub mod multikey;
 pub mod passthrough;
+pub mod read_dir;
 pub mod sandbox;
 pub mod seccomp;
 pub mod server;
