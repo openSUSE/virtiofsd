@@ -5,7 +5,7 @@
 use super::fs_cache_req_handler::FsCacheReqHandler;
 use crate::descriptor_utils::{Reader, Writer};
 use crate::filesystem::{
-    Context, DirectoryIterator, FileSystem, GetxattrReply, ListxattrReply, ZeroCopyReader,
+    Context, DirEntry, DirectoryIterator, Entry, FileSystem, GetxattrReply, ListxattrReply, ZeroCopyReader,
     ZeroCopyWriter,
 };
 use crate::fuse::*;
@@ -14,11 +14,15 @@ use std::convert::TryInto;
 use std::ffi::CStr;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::mem::size_of;
+use std::mem::{size_of, MaybeUninit};
+use std::time::Duration;
 use vm_memory::ByteValued;
 
 const MAX_BUFFER_SIZE: u32 = 1 << 20;
 const DIRENT_PADDING: [u8; 8] = [0; 8];
+
+const CURRENT_DIR_CSTR: &[u8] = b".";
+const PARENT_DIR_CSTR: &[u8] = b"..";
 
 struct ZCReader<'a>(Reader<'a>);
 
@@ -954,12 +958,106 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn do_readdir(
+    fn readdir(
         &self,
         in_header: InHeader,
         mut r: Reader,
         mut w: Writer,
-        plus: bool,
+    ) -> Result<usize> {
+        let ReadIn {
+            fh, offset, size, ..
+        } = r.read_obj().map_err(Error::DecodeMessage)?;
+
+        if size > MAX_BUFFER_SIZE  {
+            return reply_error(
+                io::Error::from_raw_os_error(libc::ENOMEM),
+                in_header.unique,
+                w,
+            );
+        }
+
+        let available_bytes = w.available_bytes();
+        if available_bytes < size as usize {
+            return reply_error(
+                io::Error::from_raw_os_error(libc::ENOMEM),
+                in_header.unique,
+                w,
+            );
+        }
+
+        // Skip over enough bytes for the header.
+        let unique = in_header.unique;
+        let mut cursor = w.split_at(size_of::<OutHeader>()).unwrap();
+        let result = match self.fs.readdir(
+            Context::from(in_header),
+            in_header.nodeid.into(),
+            fh.into(),
+            size,
+            offset,
+        ) {
+            Ok(mut entries) => {
+                let mut total_written = 0;
+                let mut err = None;
+                while let Some(dirent) = entries.next() {
+                    let remaining = (size as usize).saturating_sub(total_written);
+                    match add_dirent(&mut cursor, remaining, dirent, None) {
+                        // No more space left in the buffer.
+                        Ok(0) => break,
+                        Ok(bytes_written) => {
+                            total_written += bytes_written;
+                        }
+                        Err(e) => {
+                            err = Some(e);
+                            break
+                        },
+                    }
+                }
+                if let Some(err) = err { Err(err) } else {Ok(total_written)}
+            }
+            Err(e) => Err(e),
+        };
+
+        match result {
+            Ok(total_written) => reply_readdir(total_written, unique, w),
+            Err(e) => reply_error(e, unique, w),
+        }
+    }
+
+    fn handle_dirent<'d>(
+        &self,
+        in_header: &InHeader,
+        dir_entry: DirEntry<'d>,
+    ) -> io::Result<(DirEntry<'d>, Entry)> {
+        let parent = in_header.nodeid.into();
+        let name = dir_entry.name.to_bytes();
+        let entry = if name == CURRENT_DIR_CSTR || name == PARENT_DIR_CSTR {
+            // Don't do lookups on the current directory or the parent directory. Safe because
+            // this only contains integer fields and any value is valid.
+            let mut attr = unsafe { MaybeUninit::<libc::stat64>::zeroed().assume_init() };
+            attr.st_ino = dir_entry.ino;
+            attr.st_mode = dir_entry.type_;
+
+            // We use 0 for the inode value to indicate a negative entry.
+            Entry {
+                inode: 0,
+                generation: 0,
+                attr,
+                attr_timeout: Duration::from_secs(0),
+                entry_timeout: Duration::from_secs(0),
+            }
+        } else {
+            self.fs
+                .lookup(Context::from(*in_header), parent, dir_entry.name)?
+        };
+
+        Ok((dir_entry, entry))
+    }
+
+    fn readdirplus(
+        &self,
+        in_header: InHeader,
+        mut r: Reader,
+        mut w: Writer,
     ) -> Result<usize> {
         let ReadIn {
             fh, offset, size, ..
@@ -983,103 +1081,64 @@ impl<F: FileSystem + Sync> Server<F> {
         }
 
         // Skip over enough bytes for the header.
+        let unique = in_header.unique;
         let mut cursor = w.split_at(size_of::<OutHeader>()).unwrap();
-
-        let res = self.fs.readdirplus_dyn(
-            plus,
+        let result = match self.fs.readdir(
             Context::from(in_header),
             in_header.nodeid.into(),
             fh.into(),
             size,
             offset,
-        );
-        let mut res = match res {
-            Err(e) => return reply_error(e, in_header.unique, w),
-            Ok(v) => v,
-        };
+        ) {
+            Ok(mut entries) => {
+                let mut total_written = 0;
+                let mut err = None;
+                while let Some(dirent) = entries.next() {
+                    let mut entry_inode = None;
+                    match self.handle_dirent(&in_header, dirent).and_then(|(d, e)| {
+                        entry_inode = Some(e.inode);
+                        let remaining = (size as usize).saturating_sub(total_written);
+                        add_dirent(&mut cursor, remaining, d, Some(e))
+                    }) {
+                        Ok(0) => {
+                            // No more space left in the buffer but we need to undo the lookup
+                            // that created the Entry or we will end up with mismatched lookup
+                            // counts.
+                            if let Some(inode) = entry_inode {
+                                self.fs.forget(Context::from(in_header), inode.into(), 1);
+                            }
+                            break;
+                        }
+                        Ok(bytes_written) => {
+                            total_written += bytes_written;
+                        }
+                        Err(e) => {
+                            if let Some(inode) = entry_inode {
+                                self.fs.forget(Context::from(in_header), inode.into(), 1);
+                            }
 
-        fn overflow() -> io::Error {
-            io::Error::from_raw_os_error(libc::EOVERFLOW)
-        }
-        let max = size;
-        while let Some(entry) = res.next() {
-            let (d, entry) = match entry {
-                Err(e) => return reply_error(e, in_header.unique, w),
-                Ok(v) => v,
-            };
-            if d.name.len() > ::std::u32::MAX as usize {
-                return reply_error(overflow(), in_header.unique, w);
-            }
-            let dirent_len = if let Some(v) = size_of::<Dirent>().checked_add(d.name.len()) {
-                v
-            } else {
-                return reply_error(overflow(), in_header.unique, w);
-            };
-            // Directory entries must be padded to 8-byte alignment.  If adding 7 causes
-            // an overflow then this dirent cannot be properly padded.
-            let padded_dirent_len = if let Some(v) = dirent_len.checked_add(7).map(|l| l & !7) {
-                v
-            } else {
-                return reply_error(overflow(), in_header.unique, w);
-            };
-            let total_len = if entry.is_some() {
-                if let Some(v) = padded_dirent_len.checked_add(size_of::<EntryOut>()) {
-                    v
-                } else {
-                    return reply_error(overflow(), in_header.unique, w);
-                }
-            } else {
-                padded_dirent_len
-            };
-            if (max as usize).saturating_sub(cursor.bytes_written()) < total_len {
-                break;
-            } else {
-                if let Some(entry) = entry {
-                    if let Err(e) = cursor.write_all(EntryOut::from(entry).as_slice()) {
-                        return reply_error(e, in_header.unique, w);
+                            if total_written == 0 {
+                                // We haven't filled any entries yet so we can just propagate
+                                // the error.
+                                err = Some(e);
+                            }
+
+                            // We already filled in some entries. Returning an error now will
+                            // cause lookup count mismatches for those entries so just return
+                            // whatever we already have.
+                            break;
+                        }
                     }
                 }
-                let dirent = Dirent {
-                    ino: d.ino,
-                    off: d.offset,
-                    namelen: d.name.len() as u32,
-                    type_: d.type_,
-                };
-                if let Err(e) = cursor.write_all(dirent.as_slice()) {
-                    return reply_error(e, in_header.unique, w);
-                }
-                if let Err(e) = cursor.write_all(d.name) {
-                    return reply_error(e, in_header.unique, w);
-                }
-                // We know that `dirent_len` <= `padded_dirent_len` due to the check above
-                // so there's no need for checked arithmetic.
-                let padding = padded_dirent_len - dirent_len;
-                if padding > 0 {
-                    if let Err(e) = cursor.write_all(&DIRENT_PADDING[..padding]) {
-                        return reply_error(e, in_header.unique, w);
-                    }
-                }
+                if let Some(err) = err { Err(err) } else {Ok(total_written)}
             }
-        }
-
-        // Don't use `reply_ok` because we need to set a custom size length for the
-        // header.
-        let out = OutHeader {
-            len: (size_of::<OutHeader>() + cursor.bytes_written()) as u32,
-            error: 0,
-            unique: in_header.unique,
+            Err(e) => Err(e),
         };
 
-        w.write_all(out.as_slice()).map_err(Error::EncodeMessage)?;
-        Ok(out.len as usize)
-    }
-
-    fn readdir(&self, in_header: InHeader, r: Reader, w: Writer) -> Result<usize> {
-        self.do_readdir(in_header, r, w, false)
-    }
-
-    fn readdirplus(&self, in_header: InHeader, r: Reader, w: Writer) -> Result<usize> {
-        self.do_readdir(in_header, r, w, true)
+        match result {
+            Ok(total_written) => reply_readdir(total_written, unique, w),
+            Err(e) => reply_error(e, unique, w),
+        }
     }
 
     fn releasedir(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
@@ -1357,6 +1416,18 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 }
 
+fn reply_readdir(len: usize, unique: u64, mut w: Writer) -> Result<usize> {
+    let out = OutHeader {
+        len: (size_of::<OutHeader>() + len) as u32,
+        error: 0,
+        unique,
+    };
+
+    w.write_all(out.as_slice()).map_err(Error::EncodeMessage)?;
+    w.flush().map_err(Error::FlushMessage)?;
+    Ok(out.len as usize)
+}
+
 fn reply_ok<T: ByteValued>(
     out: Option<T>,
     data: Option<&[u8]>,
@@ -1412,4 +1483,63 @@ fn bytes_to_cstr(buf: &[u8]) -> Result<&CStr> {
     // Convert to a `CStr` first so that we can drop the '\0' byte at the end
     // and make sure there are no interior '\0' bytes.
     CStr::from_bytes_with_nul(buf).map_err(Error::InvalidCString)
+}
+
+fn add_dirent(
+    cursor: &mut Writer,
+    max: usize,
+    d: DirEntry,
+    entry: Option<Entry>,
+) -> io::Result<usize> {
+    // Strip the trailing '\0'.
+    let name = d.name.to_bytes();
+    if name.len() > ::std::u32::MAX as usize {
+        return Err(io::Error::from_raw_os_error(libc::EOVERFLOW));
+    }
+
+    let dirent_len = size_of::<Dirent>()
+        .checked_add(name.len())
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+
+    // Directory entries must be padded to 8-byte alignment.  If adding 7 causes
+    // an overflow then this dirent cannot be properly padded.
+    let padded_dirent_len = dirent_len
+        .checked_add(7)
+        .map(|l| l & !7)
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+
+    let total_len = if entry.is_some() {
+        padded_dirent_len
+            .checked_add(size_of::<EntryOut>())
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?
+    } else {
+        padded_dirent_len
+    };
+
+    if max < total_len {
+        Ok(0)
+    } else {
+        if let Some(entry) = entry {
+            cursor.write_all(EntryOut::from(entry).as_slice())?;
+        }
+
+        let dirent = Dirent {
+            ino: d.ino,
+            off: d.offset,
+            namelen: name.len() as u32,
+            type_: d.type_,
+        };
+
+        cursor.write_all(dirent.as_slice())?;
+        cursor.write_all(name)?;
+
+        // We know that `dirent_len` <= `padded_dirent_len` due to the check above
+        // so there's no need for checked arithmetic.
+        let padding = padded_dirent_len - dirent_len;
+        if padding > 0 {
+            cursor.write_all(&DIRENT_PADDING[..padding])?;
+        }
+
+        Ok(total_len)
+    }
 }

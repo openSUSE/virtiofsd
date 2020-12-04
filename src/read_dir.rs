@@ -1,17 +1,18 @@
-use crate::filesystem::{self, DirEntry, DirectoryIterator};
-use std::{
-    io,
-    mem::size_of,
-    ops::{Deref, DerefMut},
-    os::unix::io::AsRawFd,
-};
+// Copyright 2020 The Chromium OS Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+use crate::filesystem::{DirEntry, DirectoryIterator};
+
+use std::ffi::CStr;
+use std::io;
+use std::mem::size_of;
+use std::ops::{Deref, DerefMut};
+use std::os::unix::io::AsRawFd;
+
 use vm_memory::ByteValued;
 
-const CURRENT_DIR_CSTR: &[u8] = b".\0";
-const PARENT_DIR_CSTR: &[u8] = b"..\0";
-
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Default, Clone, Copy)]
 struct LinuxDirent64 {
     d_ino: libc::ino64_t,
     d_off: libc::off64_t,
@@ -21,21 +22,16 @@ struct LinuxDirent64 {
 unsafe impl ByteValued for LinuxDirent64 {}
 
 #[derive(Default)]
-pub struct ReadDir<B = Vec<u8>> {
-    buf: B,
-    start: usize,
+pub struct ReadDir<P> {
+    buf: P,
+    current: usize,
     end: usize,
 }
 
-impl<B: DerefMut<Target = [u8]>> ReadDir<B> {
-    pub fn new<D: Deref>(mut buf: B, dir: D, offset: u64) -> io::Result<Self>
-    where
-        D::Target: AsRawFd,
-    {
-        let dir = dir.deref();
+impl<P: DerefMut<Target = [u8]>> ReadDir<P> {
+    pub fn new<D: AsRawFd>(dir: &D, offset: libc::off64_t, mut buf: P) -> io::Result<Self> {
         // Safe because this doesn't modify any memory and we check the return value.
-        let res =
-            unsafe { libc::lseek64(dir.as_raw_fd(), offset as libc::off64_t, libc::SEEK_SET) };
+        let res = unsafe { libc::lseek64(dir.as_raw_fd(), offset, libc::SEEK_SET) };
         if res < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -56,20 +52,22 @@ impl<B: DerefMut<Target = [u8]>> ReadDir<B> {
 
         Ok(ReadDir {
             buf,
-            start: 0,
+            current: 0,
             end: res as usize,
         })
     }
 }
 
-impl<B: DerefMut<Target = [u8]>> ReadDir<B> {
-    // The directory entry metadata and the entry name
-    fn get_next<'b>(
-        buf: &'b B,
-        start: &mut usize,
-        end: usize,
-    ) -> Option<(&'b LinuxDirent64, &'b [u8])> {
-        let rem = &buf[*start..end];
+impl<P> ReadDir<P> {
+    /// Returns the number of bytes from the internal buffer that have not yet been consumed.
+    pub fn remaining(&self) -> usize {
+        self.end.saturating_sub(self.current)
+    }
+}
+
+impl<P: Deref<Target = [u8]>> DirectoryIterator for ReadDir<P> {
+    fn next(&mut self) -> Option<DirEntry> {
+        let rem = &self.buf[self.current..self.end];
         if rem.is_empty() {
             return None;
         }
@@ -82,41 +80,69 @@ impl<B: DerefMut<Target = [u8]>> ReadDir<B> {
         );
 
         let (front, back) = rem.split_at(size_of::<LinuxDirent64>());
+
         let dirent64 =
             LinuxDirent64::from_slice(front).expect("unable to get LinuxDirent64 from slice");
-        debug_assert!(
-            back.len() >= dirent64.d_reclen as usize,
-            "back is smaller than `d_reclen`"
-        );
 
         let namelen = dirent64.d_reclen as usize - size_of::<LinuxDirent64>();
         debug_assert!(namelen <= back.len(), "back is smaller than `namelen`");
 
-        let name = &back[..namelen];
-        *start += namelen;
+        // The kernel will pad the name with additional nul bytes until it is 8-byte aligned so
+        // we need to strip those off here.
+        let name = strip_padding(&back[..namelen]);
+        let entry = DirEntry {
+            ino: dirent64.d_ino,
+            offset: dirent64.d_off as u64,
+            type_: dirent64.d_ty as u32,
+            name,
+        };
 
-        Some((dirent64, name))
+        debug_assert!(
+            rem.len() >= dirent64.d_reclen as usize,
+            "rem is smaller than `d_reclen`"
+        );
+        self.current += dirent64.d_reclen as usize;
+
+        Some(entry)
     }
 }
 
-impl<'f, B: DerefMut<Target = [u8]>> DirectoryIterator<'f> for ReadDir<B> {
-    type Item = filesystem::DirIterItem;
+// Like `CStr::from_bytes_with_nul` but strips any bytes after the first '\0'-byte. Panics if `b`
+// doesn't contain any '\0' bytes.
+fn strip_padding(b: &[u8]) -> &CStr {
+    // It would be nice if we could use memchr here but that's locked behind an unstable gate.
+    let pos = b
+        .iter()
+        .position(|&c| c == 0)
+        .expect("`b` doesn't contain any nul bytes");
 
-    fn next<'b, 's: 'b>(&'s mut self) -> Option<DirEntry<'b>>
-    where
-        'f: 's,
-    {
-        while let Some((dirent64, name)) = Self::get_next(&self.buf, &mut self.start, self.end) {
-            // We don't want to report the "." and ".." entries.
-            if !name.starts_with(CURRENT_DIR_CSTR) && !name.starts_with(PARENT_DIR_CSTR) {
-                return Some(DirEntry {
-                    ino: dirent64.d_ino,
-                    offset: dirent64.d_off as u64,
-                    type_: u32::from(dirent64.d_ty),
-                    name,
-                });
-            }
-        }
-        None
+    // Safe because we are creating this string with the first nul-byte we found so we can
+    // guarantee that it is nul-terminated and doesn't contain any interior nuls.
+    unsafe { CStr::from_bytes_with_nul_unchecked(&b[..pos + 1]) }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn padded_cstrings() {
+        assert_eq!(strip_padding(b".\0\0\0\0\0\0\0").to_bytes(), b".");
+        assert_eq!(strip_padding(b"..\0\0\0\0\0\0").to_bytes(), b"..");
+        assert_eq!(
+            strip_padding(b"normal cstring\0").to_bytes(),
+            b"normal cstring"
+        );
+        assert_eq!(strip_padding(b"\0\0\0\0").to_bytes(), b"");
+        assert_eq!(
+            strip_padding(b"interior\0nul bytes\0\0\0").to_bytes(),
+            b"interior"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "`b` doesn't contain any nul bytes")]
+    fn no_nul_byte() {
+        strip_padding(b"no nul bytes in string");
     }
 }

@@ -80,7 +80,7 @@ pub struct DirEntry<'a> {
 
     /// The name of this directory entry. There are no requirements for the contents of this field
     /// and any sequence of bytes is considered valid.
-    pub name: &'a [u8],
+    pub name: &'a CStr,
 }
 
 /// A reply to a `getxattr` method call.
@@ -317,52 +317,12 @@ impl From<fuse::InHeader> for Context {
     }
 }
 
-/// The family of outputs for `DirectoryIterator`
-pub trait DirIterItemFamily<'b> {
-    type Output;
-}
-/// The `DirIterItemFamily` member for iterating through the results of `FileSystem::readdir`
-pub struct DirIterItem;
-/// The `DirIterItemFamily` member for iterating through the results of `FileSystem::readdirplus`
-pub struct DirIterItemPlus;
-/// The `DirIterItemFamily` member for iterating through the results of `FileSystem::readdirplus_dyn`
-pub struct DirIterItemPlusDyn;
-
-impl<'b> DirIterItemFamily<'b> for DirIterItem {
-    type Output = DirEntry<'b>;
-}
-impl<'b> DirIterItemFamily<'b> for DirIterItemPlus {
-    type Output = io::Result<(DirEntry<'b>, Entry)>;
-}
-impl<'b> DirIterItemFamily<'b> for DirIterItemPlusDyn {
-    type Output = io::Result<(DirEntry<'b>, Option<Entry>)>;
-}
-
-/// A trait for iterating over directory entries.
-///
-/// While rust doesn't support generic associated types, this trait fulfils a similar purpose to `Iterator`,
-/// but with support for the lifetime parameters necessary.
-pub trait DirectoryIterator<'f> {
-    type Item: for<'b> DirIterItemFamily<'b>;
+/// A trait for iterating over the contents of a directory. This trait is needed because rust
+/// doesn't support generic associated types, which means that it's not possible to implement a
+/// regular iterator that yields a `DirEntry` due to its generic lifetime parameter.
+pub trait DirectoryIterator {
     /// Returns the next entry in the directory or `None` if there are no more.
-    fn next<'b, 's: 'b>(&'s mut self) -> Option<<Self::Item as DirIterItemFamily<'b>>::Output>
-    where
-        'f: 's;
-}
-
-/// A trait listing to hold all the `DirectoryIterator` types and enable conversion between them.
-pub trait DirectoryIterators<'f> {
-    /// The iterator type for `FileSystem::readdir`
-    type Iter: DirectoryIterator<'f, Item = DirIterItem>;
-    /// The iterator type for `FileSystem::readdirplus`
-    type IterPlus: DirectoryIterator<'f, Item = DirIterItemPlus>;
-    /// The iterator type for `FileSystem::readdirplus_dyn`
-    type IterPlusDyn: DirectoryIterator<'f, Item = DirIterItemPlusDyn>;
-
-    /// Transforms a `Self::Iter` into a `Self::IterPlusDyn`
-    fn iter_to_dyn(v: Self::Iter) -> Self::IterPlusDyn;
-    /// Transforms a `Self::IterPlus` into a `Self::IterPlusDyn`
-    fn iter_plus_to_dyn(v: Self::IterPlus) -> Self::IterPlusDyn;
+    fn next(&mut self) -> Option<DirEntry>;
 }
 
 /// The main trait that connects a file system with a transport.
@@ -395,9 +355,9 @@ pub trait FileSystem {
     /// Represents a file or directory that is open for reading/writing.
     type Handle: From<u64> + Into<u64>;
 
-    /// Iterators over the entries of a directory. See the documentation for `readdir` for more
+    /// An iterator over the entries of a directory. See the documentation for `readdir` for more
     /// details.
-    type DirEntries: for<'f> DirectoryIterators<'f>;
+    type DirIter: DirectoryIterator;
 
     /// Initialize the file system.
     ///
@@ -996,69 +956,16 @@ pub trait FileSystem {
     ///
     /// The lookup count for `Inode`s associated with the returned directory entries is **NOT**
     /// affected by this method.
-    fn readdir<'f>(
-        &'f self,
+    ///
+    fn readdir(
+        &self,
         ctx: Context,
         inode: Self::Inode,
         handle: Self::Handle,
         size: u32,
         offset: u64,
-    ) -> io::Result<<Self::DirEntries as DirectoryIterators<'f>>::Iter> {
+    ) -> io::Result<Self::DirIter> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
-    }
-
-    /// Read a directory with entry attributes.
-    ///
-    /// Like `readdir` but also includes the attributes for each directory entry.
-    ///
-    /// `handle` is the `Handle` returned by the file system from the `opendir` method, if any. If
-    /// the file system did not return a `Handle` from `opendir` then the contents of `handle` are
-    /// undefined.
-    ///
-    /// `size` indicates the maximum number of bytes that should be returned by this method.
-    ///
-    /// Unlike `readdir`, the lookup count for `Inode`s associated with the returned directory
-    /// entries **IS** affected by this method (since it returns an `Entry` for each `DirEntry`).
-    /// The count for each `Inode` should be increased by 1.
-    ///
-    /// File systems that implement this method should enable the `FsOptions::DO_READDIRPLUS`
-    /// feature when supported by the kernel. The kernel will not call this method unless that
-    /// feature is enabled.
-    ///
-    /// Additionally, file systems that implement both `readdir` and `readdirplus` should enable the
-    /// `FsOptions::READDIRPLUS_AUTO` feature to allow the kernel to issue both `readdir` and
-    /// `readdirplus` requests, depending on how much information is expected to be required.
-    fn readdirplus<'f>(
-        &'f self,
-        ctx: Context,
-        inode: Self::Inode,
-        handle: Self::Handle,
-        size: u32,
-        offset: u64,
-    ) -> io::Result<<Self::DirEntries as DirectoryIterators<'f>>::IterPlus> {
-        Err(io::Error::from_raw_os_error(libc::ENOSYS))
-    }
-
-    /// Read a directory with or without entry attributes.
-    ///
-    /// This is just a helper method which calls either `readdir` and `readdirplus` and returns a
-    /// unified iterator type that optionally has the entry attributes.
-    fn readdirplus_dyn<'f>(
-        &'f self,
-        plus: bool,
-        ctx: Context,
-        inode: Self::Inode,
-        handle: Self::Handle,
-        size: u32,
-        offset: u64,
-    ) -> io::Result<<Self::DirEntries as DirectoryIterators<'f>>::IterPlusDyn> {
-        if plus {
-            self.readdirplus(ctx, inode, handle, size, offset)
-                .map(|v| <Self::DirEntries as DirectoryIterators<'f>>::iter_plus_to_dyn(v))
-        } else {
-            self.readdir(ctx, inode, handle, size, offset)
-                .map(|v| <Self::DirEntries as DirectoryIterators<'f>>::iter_to_dyn(v))
-        }
     }
 
     /// Synchronize the contents of a directory.
