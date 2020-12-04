@@ -5,8 +5,8 @@
 use super::fs_cache_req_handler::FsCacheReqHandler;
 use crate::descriptor_utils::{Reader, Writer};
 use crate::filesystem::{
-    Context, DirEntry, DirectoryIterator, Entry, FileSystem, GetxattrReply, ListxattrReply, ZeroCopyReader,
-    ZeroCopyWriter,
+    Context, DirEntry, DirectoryIterator, Entry, FileSystem, GetxattrReply, ListxattrReply,
+    ZeroCopyReader, ZeroCopyWriter,
 };
 use crate::fuse::*;
 use crate::{Error, Result};
@@ -958,17 +958,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn readdir(
-        &self,
-        in_header: InHeader,
-        mut r: Reader,
-        mut w: Writer,
-    ) -> Result<usize> {
+    fn readdir(&self, in_header: InHeader, mut r: Reader, mut w: Writer) -> Result<usize> {
         let ReadIn {
             fh, offset, size, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
 
-        if size > MAX_BUFFER_SIZE  {
+        if size > MAX_BUFFER_SIZE {
             return reply_error(
                 io::Error::from_raw_os_error(libc::ENOMEM),
                 in_header.unique,
@@ -1008,11 +1003,15 @@ impl<F: FileSystem + Sync> Server<F> {
                         }
                         Err(e) => {
                             err = Some(e);
-                            break
-                        },
+                            break;
+                        }
                     }
                 }
-                if let Some(err) = err { Err(err) } else {Ok(total_written)}
+                if let Some(err) = err {
+                    Err(err)
+                } else {
+                    Ok(total_written)
+                }
             }
             Err(e) => Err(e),
         };
@@ -1053,12 +1052,7 @@ impl<F: FileSystem + Sync> Server<F> {
         Ok((dir_entry, entry))
     }
 
-    fn readdirplus(
-        &self,
-        in_header: InHeader,
-        mut r: Reader,
-        mut w: Writer,
-    ) -> Result<usize> {
+    fn readdirplus(&self, in_header: InHeader, mut r: Reader, mut w: Writer) -> Result<usize> {
         let ReadIn {
             fh, offset, size, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
@@ -1130,7 +1124,11 @@ impl<F: FileSystem + Sync> Server<F> {
                         }
                     }
                 }
-                if let Some(err) = err { Err(err) } else {Ok(total_written)}
+                if let Some(err) = err {
+                    Err(err)
+                } else {
+                    Ok(total_written)
+                }
             }
             Err(e) => Err(e),
         };

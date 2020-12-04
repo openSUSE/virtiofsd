@@ -4,9 +4,8 @@
 
 use super::fs_cache_req_handler::FsCacheReqHandler;
 use crate::filesystem::{
-    Context,
-    Entry, FileSystem, FsOptions, GetxattrReply, ListxattrReply, OpenOptions, SetattrValid,
-    ZeroCopyReader, ZeroCopyWriter,
+    Context, Entry, FileSystem, FsOptions, GetxattrReply, ListxattrReply, OpenOptions,
+    SetattrValid, ZeroCopyReader, ZeroCopyWriter,
 };
 use crate::fuse;
 use crate::multikey::MultikeyBTreeMap;
@@ -324,12 +323,12 @@ impl PassthroughFs {
 
     fn find_handle(&self, handle: Handle, inode: Inode) -> io::Result<Arc<HandleData>> {
         self.handles
-        .read()
-        .unwrap()
-        .get(&handle)
-        .filter(|hd| hd.inode == inode)
-        .map(Arc::clone)
-        .ok_or_else(ebadf)
+            .read()
+            .unwrap()
+            .get(&handle)
+            .filter(|hd| hd.inode == inode)
+            .map(Arc::clone)
+            .ok_or_else(ebadf)
     }
 
     fn open_inode(&self, inode: Inode, mut flags: i32) -> io::Result<File> {
@@ -719,7 +718,7 @@ impl FileSystem for PassthroughFs {
         offset: u64,
     ) -> io::Result<Self::DirIter> {
         if size == 0 {
-            return Ok(ReadDir::default())
+            return Ok(ReadDir::default());
         }
         let data = self.find_handle(handle, inode)?;
 
