@@ -321,3 +321,10 @@ impl Sandbox {
         Ok(shared_dir_file_name)
     }
 }
+
+fn print_contents(path: &str) {
+    println!("Contents of {}:", path);
+    for path in std::fs::read_dir(path).unwrap() {
+        println!("Name: {}", path.unwrap().path().display())
+    }
+}
