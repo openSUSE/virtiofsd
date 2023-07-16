@@ -180,7 +180,8 @@ impl Sandbox {
         } else {
             // Parent.
 
-            log::debug!("Listening for events for creating socket");
+            let socket_file_name = Path::new(&self.socket_path).file_name().unwrap().to_str().unwrap();
+            log::debug!("Listening for socket creation event of {} in /socket_dir", socket_file_name);
             let mut buffer = [0u8; 4096];
             'outer: loop {
                 let events = inotify
@@ -190,27 +191,24 @@ impl Sandbox {
                 for event in events {
                     if event.mask.contains(EventMask::CREATE) {
                         if event.mask.contains(EventMask::ISDIR) {
-                            println!("Directory created: {:?}", event.name);
+                            log::debug!("Directory created: {:?}", event.name.unwrap());
                         } else {
-                            println!("File created: {:?}", event.name);
+                            log::debug!("File created: {:?}", event.name.unwrap());
                         }
-                        if event.name.unwrap().to_string_lossy().to_string() == "vfsd.sock.pid" {
+                        if event.name.unwrap().to_string_lossy().to_string() == socket_file_name {
                             break 'outer;
                         }
                     } else if event.mask.contains(EventMask::DELETE) {
                         if event.mask.contains(EventMask::ISDIR) {
-                            println!("Directory deleted: {:?}", event.name);
+                            log::debug!("Directory deleted: {:?}", event.name.unwrap());
                         } else {
-                            println!("File deleted: {:?}", event.name);
+                            log::debug!("File deleted: {:?}", event.name.unwrap());
                         }
                     } else if event.mask.contains(EventMask::MODIFY) {
                         if event.mask.contains(EventMask::ISDIR) {
-                            println!("Directory modified: {:?}", event.name);
+                            log::debug!("Directory modified: {:?}", event.name.unwrap());
                         } else {
-                            println!("File modified: {:?}", event.name);
-                        }
-                        if event.name.unwrap().to_string_lossy().to_string() == "vfsd.sock.pid" {
-                            break 'outer;
+                            log::debug!("File modified: {:?}", event.name.unwrap());
                         }
                     }
                 }
@@ -248,6 +246,8 @@ impl Sandbox {
         proc_self_fd_fd: i32,
         proc_self_mountinfo_fd: i32,
     ) {
+        let socket_file_name = Path::new(&self.socket_path).file_name().unwrap().to_str().unwrap();
+        let socket_path_new_root = format!("/socket_dir/{}", socket_file_name);
         let proc_self_fd_fd_str = proc_self_fd_fd.to_string();
         let proc_self_mountinfo_fd_str = proc_self_mountinfo_fd.to_string();
 
@@ -259,7 +259,7 @@ impl Sandbox {
         virtiofsd_args.push("--shared-dir");
         virtiofsd_args.push(shared_dir_file_name);
         virtiofsd_args.push("--socket-path");
-        virtiofsd_args.push("/socket_dir/vfsd.sock");
+        virtiofsd_args.push(&socket_path_new_root);
         virtiofsd_args.push("--proc-self-fd");
         virtiofsd_args.push(&proc_self_fd_fd_str);
         virtiofsd_args.push("--proc-self-mountinfo");
