@@ -117,8 +117,8 @@ impl Sandbox {
             if pid == 0 {
                 // Child.
 
-                let shared_dir_file_name = self.setup_mounts()?;
-                self.spawn_virtiofsd(virtiofsd_fd, &shared_dir_file_name)?;
+                self.setup_mounts()?;
+                self.spawn_virtiofsd(virtiofsd_fd, "shared_dir")?;
             } else {
                 // Parent.
 
@@ -292,7 +292,7 @@ impl Sandbox {
         );
     }
 
-    fn setup_mounts(&self) -> Result<String, Error> {
+    fn setup_mounts(&self) -> Result<(), Error> {
         // Mark the root directory as slave recursively so its mounts propagate to us, but our mounts do not propagate to it.
         oslib::mount(None, "/", None, libc::MS_SLAVE | libc::MS_REC).map_err(Error::CleanMount)?;
 
@@ -329,12 +329,7 @@ impl Sandbox {
         std::env::set_current_dir("/tmp").unwrap();
 
         // Make shared directory.
-        let shared_dir_file_name = shared_dir_abs_path
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
-        std::fs::create_dir(&shared_dir_file_name).unwrap();
+        std::fs::create_dir("shared_dir").unwrap();
         // Make lib directory.
         std::fs::create_dir("lib").unwrap();
         // Make lib64 directory.
@@ -346,10 +341,10 @@ impl Sandbox {
 
         // Bind mount the shared directory in the tmpfs.
         let shared_dir_abs_path = shared_dir_abs_path.to_string_lossy().to_string();
-        log::debug!("Mounting {} to {}", shared_dir_abs_path, shared_dir_file_name);
+        log::debug!("Mounting {} to /{} in new root", shared_dir_abs_path, "shared_dir");
         oslib::mount(
             shared_dir_abs_path.as_str().into(),
-            &shared_dir_file_name,
+            "shared_dir",
             None,
             libc::MS_BIND | libc::MS_REC,
         )
@@ -439,6 +434,6 @@ impl Sandbox {
         unsafe { libc::close(newroot_fd) };
         unsafe { libc::close(oldroot_fd) };
 
-        Ok(shared_dir_file_name)
+        Ok(())
     }
 }
