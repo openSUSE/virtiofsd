@@ -47,6 +47,13 @@ pub enum Error {
     /// Error mounting target directory.
     MountTarget(io::Error),
     /// Failed to open `/proc/self/mountinfo`.
+    /// Error mounting tmpfs.
+    MountTmpFs(io::Error),
+    /// Error mounting lib.
+    MountLib(io::Error),
+    /// Error mounting lib64.
+    MountLib64(io::Error),
+    /// Failed to open `/proc/self/mountinfo`.
     OpenMountinfo(io::Error),
     /// Failed to open new root.
     OpenNewRoot(io::Error),
@@ -308,8 +315,7 @@ impl Sandbox {
     }
 
     /// Sets mappings for the given uid and gid.
-    fn setup_id_mappings(
-        &self,
+    pub fn setup_id_mappings(
         uid_map: Option<&UidMap>,
         gid_map: Option<&GidMap>,
         pid: i32,
@@ -403,7 +409,7 @@ impl Sandbox {
             if uid != 0 {
                 let ppid = unsafe { libc::getppid() };
                 if let Err(why) =
-                    self.setup_id_mappings(self.uid_map.as_ref(), self.gid_map.as_ref(), ppid)
+                    Self::setup_id_mappings(self.uid_map.as_ref(), self.gid_map.as_ref(), ppid)
                 {
                     panic!("couldn't setup id mappings: {}", why)
                 };
