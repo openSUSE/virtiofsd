@@ -124,7 +124,7 @@ fn parse_idmap(s: &str, expected_len: usize) -> std::result::Result<Vec<u32>, Id
 
 #[derive(Debug, Eq, PartialEq)]
 #[repr(u8)]
-pub(crate) enum IdMapSetUpPipeMessage {
+pub enum IdMapSetUpPipeMessage {
     Request = 0x1,
     Done = 0x2,
 }
