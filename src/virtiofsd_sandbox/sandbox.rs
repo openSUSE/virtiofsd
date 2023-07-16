@@ -80,6 +80,14 @@ impl Sandbox {
             drop(x_reader);
             drop(y_writer);
 
+            // Obtain file descriptor for virtiofsd executable.
+            let c_virtiofsd_path =
+                CString::new(self.virtiofsd_path.clone()).expect("Invalid virtiofsd path");
+            let virtiofsd_fd = unsafe { libc::open(c_virtiofsd_path.as_ptr(), libc::O_RDONLY) };
+            if virtiofsd_fd == -1 {
+                panic!("virtiofsd_fd error: {}", io::Error::last_os_error());
+            }
+
             // Unshare namespaces. This places the current process in a new user and mount namespace.
             // Only child processes are placed in the new PID namespace.
             unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWPID) };
@@ -109,7 +117,6 @@ impl Sandbox {
                 // Child.
 
                 self.setup_mounts()?;
-                todo!()
             } else {
                 // Parent.
 
@@ -120,6 +127,47 @@ impl Sandbox {
         }
 
         Ok(())
+    }
+
+    fn exec_virtiofsd(
+        &self,
+        virtiofsd_fd: i32,
+        shared_dir_file_name: &str,
+        proc_self_fd_fd: i32,
+        proc_self_mountinfo_fd: i32,
+    ) {
+        let proc_self_fd_fd_str = proc_self_fd_fd.to_string();
+        let proc_self_mountinfo_fd_str = proc_self_mountinfo_fd.to_string();
+
+        let mut virtiofsd_args = Vec::new();
+        virtiofsd_args.push(self.virtiofsd_path.as_str());
+        virtiofsd_args.push("--sandbox");
+        virtiofsd_args.push("none");
+        virtiofsd_args.extend(self.virtiofsd_args.iter().map(|s| s.as_str()));
+        virtiofsd_args.push("--shared-dir");
+        virtiofsd_args.push(shared_dir_file_name);
+        virtiofsd_args.push("--socket-path");
+        virtiofsd_args.push("/socket-dir/vfsd.sock");
+        virtiofsd_args.push("--proc-self-fd");
+        virtiofsd_args.push(&proc_self_fd_fd_str);
+        virtiofsd_args.push("--proc-self-mountinfo");
+        virtiofsd_args.push(&proc_self_mountinfo_fd_str);
+
+        log::debug!("virtiofsd arguments: {:?}", virtiofsd_args);
+
+        // Transform arguments into CString's.
+        let virtiofsd_args: Vec<CString> = virtiofsd_args
+            .into_iter()
+            .map(|s| CString::new(s).expect(&format!("Invalid argument: {}", s)))
+            .collect();
+
+        // Collect pointers of arguments.
+        let mut virtiofsd_args: Vec<*const i8> =
+            virtiofsd_args.iter().map(|s| s.as_ptr()).collect();
+        virtiofsd_args.push(std::ptr::null());
+
+        // Execute virtiofsd.
+        todo!()
     }
 
     fn setup_mounts(&self) -> Result<String, Error> {
