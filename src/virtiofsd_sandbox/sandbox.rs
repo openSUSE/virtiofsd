@@ -5,6 +5,7 @@ use std::{
     process,
 };
 
+use inotify::{EventMask, Inotify, WatchMask};
 use virtiofsd::{
     idmap::{self, GidMap, UidMap},
     oslib,
@@ -116,7 +117,8 @@ impl Sandbox {
             if pid == 0 {
                 // Child.
 
-                self.setup_mounts()?;
+                let shared_dir_file_name = self.setup_mounts()?;
+                self.spawn_virtiofsd(virtiofsd_fd, &shared_dir_file_name)?;
             } else {
                 // Parent.
 
@@ -124,6 +126,142 @@ impl Sandbox {
                 // Never returns.
                 unsafe { libc::waitpid(pid, &mut status, 0) };
             }
+        }
+
+        Ok(())
+    }
+
+    fn spawn_virtiofsd(
+        &self,
+        //socket_listener_fd: i32,
+        virtiofsd_fd: i32,
+        shared_dir_file_name: &str,
+    ) -> Result<(), Error> {
+        // Create a pipe for virtiofsd to tell us when it has started.
+        //let (mut reader, writer) = oslib::pipe().unwrap();
+
+        print_contents("/socket-dir");
+
+        let mut inotify = Inotify::init().expect("Failed to initialize inotify");
+        inotify
+            .watches()
+            .add(
+                Path::new("socket-dir"),
+                WatchMask::MODIFY | WatchMask::CREATE | WatchMask::DELETE,
+            )
+            .expect("Failed to add inotify watch");
+
+        let pid = util::sfork().map_err(Error::Fork)?;
+        if pid == 0 {
+            // Child.
+
+            // Drop read end of pipe so we are notified if the pipe is broken, i.e., the parent died.
+            //drop(reader);
+            drop(inotify);
+
+            // Get file descriptors for /proc/self/fd and /proc/self/mountinfo.
+            let c_proc_pid_fd_path = CString::new("/proc/self/fd").unwrap();
+            let proc_pid_fd_fd = unsafe { libc::open(c_proc_pid_fd_path.as_ptr(), libc::O_PATH) };
+            if proc_pid_fd_fd < 0 {
+                return Err(Error::OpenProcSelfFd(io::Error::last_os_error()));
+            }
+            let cproc_pid_mountinfo_fd_path = CString::new("/proc/self/mountinfo").unwrap();
+            let proc_pid_mountinfo_fd =
+                unsafe { libc::open(cproc_pid_mountinfo_fd_path.as_ptr(), libc::O_PATH) };
+            if proc_pid_mountinfo_fd < 0 {
+                return Err(Error::OpenProcSelfFd(io::Error::last_os_error()));
+            }
+
+            assert_eq!(unsafe { libc::fcntl(proc_pid_fd_fd, libc::F_GETFD) }, 0);
+            assert_eq!(
+                unsafe { libc::fcntl(proc_pid_mountinfo_fd, libc::F_GETFD) },
+                0
+            );
+
+            self.exec_virtiofsd(
+                //socket_listener_fd,
+                virtiofsd_fd,
+                shared_dir_file_name,
+                //writer.as_raw_fd(),
+                proc_pid_fd_fd,
+                proc_pid_mountinfo_fd,
+            );
+        } else {
+            // Parent.
+
+            // Drop write end of pipe so we are notified if the pipe is broken, i.e., the child died.
+            //drop(writer);
+
+            // Wait until virtiofsd has started.
+            // let mut output = [0];
+            // reader.read_exact(&mut output).unwrap();
+            // assert_eq!(output[0], IdMapSetUpPipeMessage::Done as u8);
+
+            print_contents("/");
+
+            log::debug!("Listening for events for creating socket");
+            let mut buffer = [0u8; 4096];
+            'outer: loop {
+                let events = inotify
+                    .read_events_blocking(&mut buffer)
+                    .expect("Failed to read inotify events");
+
+                for event in events {
+                    if event.mask.contains(EventMask::CREATE) {
+                        if event.mask.contains(EventMask::ISDIR) {
+                            println!("Directory created: {:?}", event.name);
+                        } else {
+                            println!("File created: {:?}", event.name);
+                        }
+                        if event.name.unwrap().to_string_lossy().to_string() == "vfsd.sock.pid" {
+                            break 'outer;
+                        }
+                    } else if event.mask.contains(EventMask::DELETE) {
+                        if event.mask.contains(EventMask::ISDIR) {
+                            println!("Directory deleted: {:?}", event.name);
+                        } else {
+                            println!("File deleted: {:?}", event.name);
+                        }
+                    } else if event.mask.contains(EventMask::MODIFY) {
+                        if event.mask.contains(EventMask::ISDIR) {
+                            println!("Directory modified: {:?}", event.name);
+                        } else {
+                            println!("File modified: {:?}", event.name);
+                        }
+                        if event.name.unwrap().to_string_lossy().to_string() == "vfsd.sock.pid" {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+
+            drop(inotify);
+
+            print_contents("socket-dir");
+
+            log::debug!("virtiofsd started, unmounting dependencies");
+
+            // Unmount and remove /proc now that virtiofsd is running.
+            // We keep /lib and /lib64 mounted in case lazy loading in dynamic linker is enabled.
+            oslib::umount2("/proc", libc::MNT_DETACH).unwrap();
+            std::fs::remove_dir("/proc").unwrap();
+
+            oslib::umount2("/socket-dir", libc::MNT_DETACH).unwrap();
+            std::fs::remove_dir("/socket-dir").unwrap();
+
+            // Remount new root as read-only.
+            oslib::mount(
+                None,
+                ".",
+                None,
+                libc::MS_BIND | libc::MS_REC | libc::MS_REMOUNT | libc::MS_RDONLY,
+            )
+            .map_err(Error::CleanMount)?;
+
+            //print_contents("/");
+
+            let mut status = 0;
+            unsafe { libc::waitpid(pid, &mut status, 0) };
         }
 
         Ok(())
@@ -167,7 +305,18 @@ impl Sandbox {
         virtiofsd_args.push(std::ptr::null());
 
         // Execute virtiofsd.
-        todo!()
+        let res = unsafe {
+            libc::fexecve(
+                virtiofsd_fd,
+                virtiofsd_args.as_ptr(),
+                [std::ptr::null()].as_ptr(),
+            )
+        };
+        unreachable!(
+            "fexecve() error (returned {}): {}",
+            res,
+            io::Error::last_os_error()
+        );
     }
 
     fn setup_mounts(&self) -> Result<String, Error> {
