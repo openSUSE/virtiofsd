@@ -137,10 +137,11 @@ impl Sandbox {
         shared_dir_file_name: &str,
     ) -> Result<(), Error> {
         let mut inotify = Inotify::init().expect("Failed to initialize inotify");
+        log::debug!("Adding inotify watch for /socket_dir");
         inotify
             .watches()
             .add(
-                Path::new("socket-dir"),
+                Path::new("socket_dir"),
                 WatchMask::MODIFY | WatchMask::CREATE | WatchMask::DELETE,
             )
             .expect("Failed to add inotify watch");
@@ -221,8 +222,8 @@ impl Sandbox {
             oslib::umount2("/proc", libc::MNT_DETACH).unwrap();
             std::fs::remove_dir("/proc").unwrap();
 
-            oslib::umount2("/socket-dir", libc::MNT_DETACH).unwrap();
-            std::fs::remove_dir("/socket-dir").unwrap();
+            oslib::umount2("/socket_dir", libc::MNT_DETACH).unwrap();
+            std::fs::remove_dir("/socket_dir").unwrap();
 
             // Remount new root as read-only.
             oslib::mount(
@@ -258,7 +259,7 @@ impl Sandbox {
         virtiofsd_args.push("--shared-dir");
         virtiofsd_args.push(shared_dir_file_name);
         virtiofsd_args.push("--socket-path");
-        virtiofsd_args.push("/socket-dir/vfsd.sock");
+        virtiofsd_args.push("/socket_dir/vfsd.sock");
         virtiofsd_args.push("--proc-self-fd");
         virtiofsd_args.push(&proc_self_fd_fd_str);
         virtiofsd_args.push("--proc-self-mountinfo");
@@ -337,7 +338,7 @@ impl Sandbox {
         // Make proc directory.
         std::fs::create_dir("proc").unwrap();
         // Make directory the socket file is to be mounted in.
-        std::fs::create_dir("socket-dir").unwrap();
+        std::fs::create_dir("socket_dir").unwrap();
 
         // Bind mount the shared directory in the tmpfs.
         let shared_dir_abs_path = shared_dir_abs_path.to_string_lossy().to_string();
@@ -358,11 +359,11 @@ impl Sandbox {
         oslib::mount("/lib64".into(), "lib64", None, libc::MS_BIND | libc::MS_REC)
             .map_err(Error::MountLib64)?;
 
-        // Bind mount /socket-dir.
-        log::debug!("Mounting {} to {}", socket_dir_abs_path, "socket_dir");
+        // Bind mount /socket_dir.
+        log::debug!("Mounting {} to /{} in new root", socket_dir_abs_path, "socket_dir");
         oslib::mount(
             socket_dir_abs_path.as_str().into(),
-            "socket-dir",
+            "socket_dir",
             None,
             libc::MS_BIND | libc::MS_REC,
         )
