@@ -133,15 +133,9 @@ impl Sandbox {
 
     fn spawn_virtiofsd(
         &self,
-        //socket_listener_fd: i32,
         virtiofsd_fd: i32,
         shared_dir_file_name: &str,
     ) -> Result<(), Error> {
-        // Create a pipe for virtiofsd to tell us when it has started.
-        //let (mut reader, writer) = oslib::pipe().unwrap();
-
-        print_contents("/socket-dir");
-
         let mut inotify = Inotify::init().expect("Failed to initialize inotify");
         inotify
             .watches()
@@ -155,8 +149,6 @@ impl Sandbox {
         if pid == 0 {
             // Child.
 
-            // Drop read end of pipe so we are notified if the pipe is broken, i.e., the parent died.
-            //drop(reader);
             drop(inotify);
 
             // Get file descriptors for /proc/self/fd and /proc/self/mountinfo.
@@ -179,25 +171,13 @@ impl Sandbox {
             );
 
             self.exec_virtiofsd(
-                //socket_listener_fd,
                 virtiofsd_fd,
                 shared_dir_file_name,
-                //writer.as_raw_fd(),
                 proc_pid_fd_fd,
                 proc_pid_mountinfo_fd,
             );
         } else {
             // Parent.
-
-            // Drop write end of pipe so we are notified if the pipe is broken, i.e., the child died.
-            //drop(writer);
-
-            // Wait until virtiofsd has started.
-            // let mut output = [0];
-            // reader.read_exact(&mut output).unwrap();
-            // assert_eq!(output[0], IdMapSetUpPipeMessage::Done as u8);
-
-            print_contents("/");
 
             log::debug!("Listening for events for creating socket");
             let mut buffer = [0u8; 4096];
@@ -234,11 +214,6 @@ impl Sandbox {
                     }
                 }
             }
-
-            drop(inotify);
-
-            print_contents("socket-dir");
-
             log::debug!("virtiofsd started, unmounting dependencies");
 
             // Unmount and remove /proc now that virtiofsd is running.
@@ -257,8 +232,6 @@ impl Sandbox {
                 libc::MS_BIND | libc::MS_REC | libc::MS_REMOUNT | libc::MS_RDONLY,
             )
             .map_err(Error::CleanMount)?;
-
-            //print_contents("/");
 
             let mut status = 0;
             unsafe { libc::waitpid(pid, &mut status, 0) };
@@ -336,7 +309,6 @@ impl Sandbox {
         let shared_dir_abs_path = Path::new(&self.shared_dir).canonicalize().unwrap();
 
         // Get path of directory containing socket file.
-        dbg!(&self.socket_path);
         // Handle cases of:
         // - vfsd.sock
         // - ./vfsd.sock`
@@ -351,9 +323,7 @@ impl Sandbox {
                 }
             })
             .unwrap_or(Path::new("."));
-        dbg!(&parent);
         let socket_dir_abs_path = parent.canonicalize().unwrap().to_string_lossy().to_string();
-        dbg!(&socket_dir_abs_path);
 
         // Switch our working directory to the new tmpfs.
         std::env::set_current_dir("/tmp").unwrap();
@@ -376,6 +346,7 @@ impl Sandbox {
 
         // Bind mount the shared directory in the tmpfs.
         let shared_dir_abs_path = shared_dir_abs_path.to_string_lossy().to_string();
+        log::debug!("Mounting {} to {}", shared_dir_abs_path, shared_dir_file_name);
         oslib::mount(
             shared_dir_abs_path.as_str().into(),
             &shared_dir_file_name,
@@ -393,6 +364,7 @@ impl Sandbox {
             .map_err(Error::MountLib64)?;
 
         // Bind mount /socket-dir.
+        log::debug!("Mounting {} to {}", socket_dir_abs_path, "socket_dir");
         oslib::mount(
             socket_dir_abs_path.as_str().into(),
             "socket-dir",
@@ -468,12 +440,5 @@ impl Sandbox {
         unsafe { libc::close(oldroot_fd) };
 
         Ok(shared_dir_file_name)
-    }
-}
-
-fn print_contents(path: &str) {
-    println!("Contents of {}:", path);
-    for path in std::fs::read_dir(path).unwrap() {
-        println!("Name: {}", path.unwrap().path().display())
     }
 }

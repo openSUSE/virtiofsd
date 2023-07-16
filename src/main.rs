@@ -10,7 +10,6 @@ use std::collections::HashSet;
 use std::convert::{self, TryFrom, TryInto};
 use std::ffi::CString;
 use std::fs::File;
-use std::io::Write;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::Path;
 use std::str::FromStr;
@@ -1021,8 +1020,6 @@ fn main() {
 
     let mut proc_sfd_rawfd = sandbox.get_proc_self_fd();
     let mut proc_mountinfo_rawfd = sandbox.get_mountinfo_fd();
-    dbg!(&proc_sfd_rawfd);
-    dbg!(&proc_mountinfo_rawfd);
     if proc_sfd_rawfd.is_none() && proc_mountinfo_rawfd.is_none() {
         log::info!("got proc fds from args");
         proc_sfd_rawfd = opt.proc_self_fd.map(|fd| unsafe { File::from_raw_fd(fd) });
