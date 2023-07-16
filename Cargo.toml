@@ -27,6 +27,12 @@ vm-memory = { version = "0.12.0", features = ["backend-mmap", "backend-atomic"] 
 virtio-queue = "0.9.0"
 vmm-sys-util = "0.11.1"
 syslog = "6.0"
+clap = { version = "4.3.3", features = ["derive"] }
+inotify = "0.10.1"
 
 [profile.release]
 lto = true
+
+[[bin]]
+name = "virtiofsd_sandbox"
+path = "src/virtiofsd_sandbox/main.rs"
