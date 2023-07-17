@@ -42,6 +42,8 @@ impl Sandbox {
     }
 
     pub fn enter(&self) -> Result<(), Error> {
+        let uid = unsafe { libc::geteuid() };
+
         // Create pipes for synchronization between parent and child processes.
         let (mut x_reader, mut x_writer) = oslib::pipe().unwrap();
         let (mut y_reader, mut y_writer) = oslib::pipe().unwrap();
@@ -63,12 +65,14 @@ impl Sandbox {
             assert_eq!(output[0], idmap::IdMapSetUpPipeMessage::Request as u8);
 
             let ppid = unsafe { libc::getppid() };
-            virtiofsd::sandbox::Sandbox::setup_id_mappings(
-                self.uid_map.as_ref(),
-                self.gid_map.as_ref(),
-                ppid,
-            )?;
-
+            if uid != 0 {
+                virtiofsd::sandbox::Sandbox::setup_id_mappings(
+                    self.uid_map.as_ref(),
+                    self.gid_map.as_ref(),
+                    ppid,
+                )?;
+            }
+            
             y_writer
                 .write_all(&[idmap::IdMapSetUpPipeMessage::Done as u8])
                 .unwrap();
@@ -91,7 +95,13 @@ impl Sandbox {
 
             // Unshare namespaces. This places the current process in a new user and mount namespace.
             // Only child processes are placed in the new PID namespace.
-            unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWPID) };
+            let flags = if uid == 0 {
+                libc::CLONE_NEWPID | libc::CLONE_NEWNS
+            } else {
+                // If running as an unprivileged user, rely on user_namespaces(7) for isolation.
+                libc::CLONE_NEWPID | libc::CLONE_NEWNS | libc::CLONE_NEWUSER
+            };
+            unsafe { libc::unshare(flags) };
 
             // Signal that unshare() has returned.
             x_writer
