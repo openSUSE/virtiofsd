@@ -307,10 +307,14 @@ impl Sandbox {
         // Mark the root directory as slave recursively so its mounts propagate to us, but our mounts do not propagate to it.
         oslib::mount(None, "/", None, libc::MS_SLAVE | libc::MS_REC).map_err(Error::CleanMount)?;
 
+        // Create the new root directory with a UUID-based name, virtually guaranteeing that its name is unique.
+        let new_root_dir = format!("/tmp/virtiofsd_{}/", uuid::Uuid::new_v4().to_string());
+        log::debug!("New root directory: {}", new_root_dir);
+        std::fs::create_dir(&new_root_dir).unwrap();
         // Create a tmpfs which we will use as the new root filesystem.
         oslib::mount(
             "tmpfs".into(),
-            "/tmp",
+            &new_root_dir,
             "tmpfs".into(),
             libc::MS_NODEV | libc::MS_NOSUID,
         )
@@ -337,7 +341,7 @@ impl Sandbox {
         let socket_dir_abs_path = parent.canonicalize().unwrap().to_string_lossy().to_string();
 
         // Switch our working directory to the new tmpfs.
-        std::env::set_current_dir("/tmp").unwrap();
+        std::env::set_current_dir(new_root_dir).unwrap();
 
         // Make shared directory.
         std::fs::create_dir("shared_dir").unwrap();
@@ -403,7 +407,7 @@ impl Sandbox {
             return Err(Error::OpenNewRoot(std::io::Error::last_os_error()));
         }
 
-        // Our current working directory is `/tmp`.
+        // Our current working directory is `new_root_dir`.
         // Call to `pivot_root` using `.` as both new and old root.
         let c_current_dir = CString::new(".").unwrap();
         let ret = unsafe {
