@@ -72,7 +72,7 @@ impl Sandbox {
                     ppid,
                 )?;
             }
-            
+
             y_writer
                 .write_all(&[idmap::IdMapSetUpPipeMessage::Done as u8])
                 .unwrap();
@@ -141,11 +141,7 @@ impl Sandbox {
         Ok(())
     }
 
-    fn spawn_virtiofsd(
-        &self,
-        virtiofsd_fd: i32,
-        shared_dir_file_name: &str,
-    ) -> Result<(), Error> {
+    fn spawn_virtiofsd(&self, virtiofsd_fd: i32, shared_dir_file_name: &str) -> Result<(), Error> {
         let mut inotify = Inotify::init().expect("Failed to initialize inotify");
         log::debug!("Adding inotify watch for /socket_dir");
         inotify
@@ -190,8 +186,15 @@ impl Sandbox {
         } else {
             // Parent.
 
-            let socket_file_name = Path::new(&self.socket_path).file_name().unwrap().to_str().unwrap();
-            log::debug!("Listening for socket creation event of {} in /socket_dir", socket_file_name);
+            let socket_file_name = Path::new(&self.socket_path)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            log::debug!(
+                "Listening for socket creation event of {} in /socket_dir",
+                socket_file_name
+            );
             let mut buffer = [0u8; 4096];
             'outer: loop {
                 let events = inotify
@@ -205,7 +208,7 @@ impl Sandbox {
                         } else {
                             log::debug!("File created: {:?}", event.name.unwrap());
                         }
-                        if event.name.unwrap().to_string_lossy().to_string() == socket_file_name {
+                        if event.name.unwrap().to_string_lossy() == socket_file_name {
                             break 'outer;
                         }
                     } else if event.mask.contains(EventMask::DELETE) {
@@ -224,6 +227,8 @@ impl Sandbox {
                 }
             }
             log::debug!("virtiofsd started, unmounting dependencies");
+
+            print_contents("/socket_dir");
 
             // Unmount and remove /proc now that virtiofsd is running.
             // We keep /lib and /lib64 mounted in case lazy loading in dynamic linker is enabled.
@@ -256,7 +261,11 @@ impl Sandbox {
         proc_self_fd_fd: i32,
         proc_self_mountinfo_fd: i32,
     ) {
-        let socket_file_name = Path::new(&self.socket_path).file_name().unwrap().to_str().unwrap();
+        let socket_file_name = Path::new(&self.socket_path)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
         let socket_path_new_root = format!("/socket_dir/{}", socket_file_name);
         let proc_self_fd_fd_str = proc_self_fd_fd.to_string();
         let proc_self_mountinfo_fd_str = proc_self_mountinfo_fd.to_string();
@@ -280,7 +289,7 @@ impl Sandbox {
         // Transform arguments into CString's.
         let virtiofsd_args: Vec<CString> = virtiofsd_args
             .into_iter()
-            .map(|s| CString::new(s).expect(&format!("Invalid argument: {}", s)))
+            .map(|s| CString::new(s).unwrap_or_else(|_| panic!("Invalid argument: {}", s)))
             .collect();
 
         // Collect pointers of arguments.
@@ -308,7 +317,7 @@ impl Sandbox {
         oslib::mount(None, "/", None, libc::MS_SLAVE | libc::MS_REC).map_err(Error::CleanMount)?;
 
         // Create the new root directory with a UUID-based name, virtually guaranteeing that its name is unique.
-        let new_root_dir = format!("/tmp/virtiofsd_{}/", uuid::Uuid::new_v4().to_string());
+        let new_root_dir = format!("/tmp/virtiofsd_{}/", uuid::Uuid::new_v4());
         log::debug!("New root directory: {}", new_root_dir);
         std::fs::create_dir(&new_root_dir).unwrap();
         // Create a tmpfs which we will use as the new root filesystem.
@@ -356,7 +365,11 @@ impl Sandbox {
 
         // Bind mount the shared directory in the tmpfs.
         let shared_dir_abs_path = shared_dir_abs_path.to_string_lossy().to_string();
-        log::debug!("Mounting {} to /{} in new root", shared_dir_abs_path, "shared_dir");
+        log::debug!(
+            "Mounting {} to /{} in new root",
+            shared_dir_abs_path,
+            "shared_dir"
+        );
         oslib::mount(
             shared_dir_abs_path.as_str().into(),
             "shared_dir",
@@ -374,7 +387,11 @@ impl Sandbox {
             .map_err(Error::MountLib64)?;
 
         // Bind mount /socket_dir.
-        log::debug!("Mounting {} to /{} in new root", socket_dir_abs_path, "socket_dir");
+        log::debug!(
+            "Mounting {} to /{} in new root",
+            socket_dir_abs_path,
+            "socket_dir"
+        );
         oslib::mount(
             socket_dir_abs_path.as_str().into(),
             "socket_dir",
@@ -450,5 +467,12 @@ impl Sandbox {
         unsafe { libc::close(oldroot_fd) };
 
         Ok(())
+    }
+}
+
+fn print_contents(path: &str) {
+    println!("Contents of {}:", path);
+    for path in std::fs::read_dir(path).unwrap() {
+        println!("Name: {}", path.unwrap().path().display())
     }
 }

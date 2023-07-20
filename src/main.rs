@@ -950,7 +950,7 @@ fn main() {
         error!("Error increasing number of open files: {}", error);
         process::exit(1)
     });
-    
+
     // We need to keep _pid_file around because it maintains a lock on the pid file
     // that prevents another daemon from using the same pid file.
     let (listener, socket_path, _pid_file) = match opt.fd.as_ref() {
@@ -1023,7 +1023,9 @@ fn main() {
     if proc_sfd_rawfd.is_none() && proc_mountinfo_rawfd.is_none() {
         log::info!("got proc fds from args");
         proc_sfd_rawfd = opt.proc_self_fd.map(|fd| unsafe { File::from_raw_fd(fd) });
-        proc_mountinfo_rawfd = opt.proc_self_mountinfo.map(|fd| unsafe { File::from_raw_fd(fd) });
+        proc_mountinfo_rawfd = opt
+            .proc_self_mountinfo
+            .map(|fd| unsafe { File::from_raw_fd(fd) });
     }
 
     let fs_cfg = passthrough::Config {
@@ -1034,8 +1036,8 @@ fn main() {
         mountinfo_prefix: sandbox.get_mountinfo_prefix(),
         xattr,
         xattrmap,
-        proc_sfd_rawfd: proc_sfd_rawfd,
-        proc_mountinfo_rawfd: proc_mountinfo_rawfd,
+        proc_sfd_rawfd,
+        proc_mountinfo_rawfd,
         announce_submounts,
         inode_file_handles: opt.inode_file_handles.into(),
         readdirplus,
