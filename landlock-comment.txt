@@ -1,0 +1,4 @@
+@germag Regarding what we discussed in the last meeting, you were right in that performing operations on `/proc/self/fd` and `/proc/self/mountinfo` is not allowed after Landlock restriction; I didn't catch this since with default command arguments `/proc/self/fd` is only "opened" with the O_PATH flag until you perform and operation that actually opens it, and `/proc/self/mountinfo` is not opened at all.
+Opening `/proc/self/fd` and `/proc/self/mountinfo` prior to Landlock restriction and passing their file descriptors to `PassthroughFs` works fine.
+However, if I pass `--inode-file-handles=[prefer|mandatory]` then `PassthroughFs` will read the root mount path from `proc/self/mountinfo` and [attempt to reopen `/` here](https://gitlab.com/virtio-fs/virtiofsd/-/blob/main/src/passthrough/mount_fd.rs#L282), which obviously fails.
+Do you have any ideas on how to combat this issue?

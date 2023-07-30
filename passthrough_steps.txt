@@ -1,0 +1,19 @@
+src/passthrough/mod.rs:
+PassthroughFs::new @ ~405
+check_working_file_handles @ ~582
+
+src/passthrough/file_handle.rs:
+to_openable() @ ~117
+
+src/passthrough/mount_fd.rs:
+
+get() @ ~282
+
+^ Opening with O_RDONLY fails here due to reopening file after Landlock restriction.
+Opening /proc/self/mountinfo as O_PATH fails earlier due to reading file after Landlock restriction, namely at
+src/passthrough/mount_fd.rs @ get_mount_root() @ ~332
+
+Easiest to just add Landlock rule for /proc/self/mountinfo.
+
+/proc/self/fd is read in some filesystem operations, still need to exercise those to see what would happen.
+If this fd is not reopened, opening it as O_RDWR before Landlock restriction should work.

@@ -127,6 +127,8 @@ impl fmt::Display for Error {
 /// Mechanism to be used for setting up the sandbox.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SandboxMode {
+    /// The sandbox has been created by the external tool.
+    External,
     /// Create the sandbox using Linux namespaces.
     Namespace,
     /// Create the sandbox using chroot.
@@ -139,6 +141,7 @@ impl FromStr for SandboxMode {
     type Err = &'static str;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
+            "external" => Ok(SandboxMode::External),
             "namespace" => Ok(SandboxMode::Namespace),
             "chroot" => Ok(SandboxMode::Chroot),
             "none" => Ok(SandboxMode::None),
@@ -551,7 +554,7 @@ impl Sandbox {
         match self.sandbox_mode {
             SandboxMode::Namespace => self.enter_namespace(),
             SandboxMode::Chroot => self.enter_chroot(),
-            SandboxMode::None => Ok(()),
+            SandboxMode::None | SandboxMode::External => Ok(()),
         }
     }
 
@@ -565,7 +568,7 @@ impl Sandbox {
 
     pub fn get_root_dir(&self) -> String {
         match self.sandbox_mode {
-            SandboxMode::Namespace | SandboxMode::Chroot => "/".to_string(),
+            SandboxMode::External | SandboxMode::Namespace | SandboxMode::Chroot => "/".to_string(),
             SandboxMode::None => self.shared_dir.clone(),
         }
     }
@@ -574,7 +577,7 @@ impl Sandbox {
     /// accessible in our sandbox
     pub fn get_mountinfo_prefix(&self) -> Option<String> {
         match self.sandbox_mode {
-            SandboxMode::Namespace | SandboxMode::None => None,
+            SandboxMode::External | SandboxMode::Namespace | SandboxMode::None => None,
             SandboxMode::Chroot => Some(self.shared_dir.clone()),
         }
     }
