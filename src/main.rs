@@ -1002,7 +1002,7 @@ fn main() {
 
     let mut sandbox = Sandbox::new(
         shared_dir.to_string(),
-        sandbox_mode,
+        sandbox_mode.clone(),
         opt.uid_map,
         opt.gid_map,
     )
@@ -1018,15 +1018,21 @@ fn main() {
         process::exit(1)
     });
 
-    let mut proc_sfd_rawfd = sandbox.get_proc_self_fd();
-    let mut proc_mountinfo_rawfd = sandbox.get_mountinfo_fd();
-    if proc_sfd_rawfd.is_none() && proc_mountinfo_rawfd.is_none() {
-        log::info!("got proc fds from args");
-        proc_sfd_rawfd = opt.proc_self_fd.map(|fd| unsafe { File::from_raw_fd(fd) });
-        proc_mountinfo_rawfd = opt
-            .proc_self_mountinfo
-            .map(|fd| unsafe { File::from_raw_fd(fd) });
-    }
+    let (proc_sfd_rawfd, proc_mountinfo_rawfd) = match sandbox_mode {
+        SandboxMode::External => {
+            if opt.proc_self_fd.is_none() && opt.proc_self_mountinfo.is_none() {
+                error!("`--sandbox external` requires `--proc-self-fd [fd]` and `--proc-self-mountinfo [fd]`");
+                process::exit(1);
+            }
+            let proc_sfd_rawfd = opt.proc_self_fd.map(|fd| unsafe { File::from_raw_fd(fd) });
+            let proc_mountinfo_rawfd = opt
+                .proc_self_mountinfo
+                .map(|fd| unsafe { File::from_raw_fd(fd) });
+
+            (proc_sfd_rawfd, proc_mountinfo_rawfd)
+        }
+        _ => (sandbox.get_proc_self_fd(), sandbox.get_mountinfo_fd()),
+    };
 
     let fs_cfg = passthrough::Config {
         entry_timeout: timeout,
