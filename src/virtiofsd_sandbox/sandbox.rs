@@ -273,7 +273,7 @@ impl Sandbox {
         let mut virtiofsd_args = Vec::new();
         virtiofsd_args.push(self.virtiofsd_path.as_str());
         virtiofsd_args.push("--sandbox");
-        virtiofsd_args.push("none");
+        virtiofsd_args.push("external");
         virtiofsd_args.extend(self.virtiofsd_args.iter().map(|s| s.as_str()));
         virtiofsd_args.push("--shared-dir");
         virtiofsd_args.push(shared_dir_file_name);
