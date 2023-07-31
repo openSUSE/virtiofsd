@@ -547,7 +547,7 @@ impl Sandbox {
         // supplementary groups even if wanted to. Only way to do this
         // will be to use newuidmap/newgidmap to setup user namespace
         // which will allow setgroups().
-        if uid == 0 {
+        if uid == 0 && self.sandbox_mode != SandboxMode::External {
             self.drop_supplemental_groups()?;
         }
 
