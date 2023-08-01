@@ -11,6 +11,7 @@ pub mod filesystem;
 pub mod fs_cache_req_handler;
 pub mod fuse;
 pub mod idmap;
+pub(crate) mod landlock;
 pub mod limits;
 pub mod macros;
 pub mod oslib;
