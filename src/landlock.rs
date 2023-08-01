@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::oslib::check_retval;
 use bitflags::bitflags;
 use libc::{

@@ -2,12 +2,12 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use crate::{idmap, oslib, util};
+use crate::{idmap, landlock, oslib, util};
 use idmap::{GidMap, IdMapSetUpPipeMessage, UidMap};
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::Path;
 use std::process::{self, Command};
@@ -81,6 +81,8 @@ pub enum Error {
     SandboxModeInvalidUidMap,
     /// Setting gid_map is only allowed inside a namespace for non-privileged users
     SandboxModeInvalidGidMap,
+    /// Error during Landlock setup
+    LandlockError(landlock::Error),
 }
 
 impl error::Error for Error {}
@@ -88,8 +90,8 @@ impl error::Error for Error {}
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use self::Error::{
-            SandboxModeInvalidGidMap, SandboxModeInvalidUID, SandboxModeInvalidUidMap, WriteGidMap,
-            WriteUidMap,
+            LandlockError, SandboxModeInvalidGidMap, SandboxModeInvalidUID,
+            SandboxModeInvalidUidMap, WriteGidMap, WriteUidMap,
         };
         match self {
             SandboxModeInvalidUID => {
@@ -115,14 +117,23 @@ impl fmt::Display for Error {
             }
             WriteUidMap(msg) => write!(f, "write to uid map failed: {msg}"),
             WriteGidMap(msg) => write!(f, "write to gid map failed: {msg}"),
+            LandlockError(err) => write!(f, "Landlock error: {err}"),
             _ => write!(f, "{self:?}"),
         }
+    }
+}
+
+impl From<landlock::Error> for Error {
+    fn from(value: landlock::Error) -> Self {
+        Error::LandlockError(value)
     }
 }
 
 /// Mechanism to be used for setting up the sandbox.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SandboxMode {
+    /// Create the sandbox with Landlock, restricting the access rights of the process to the shared directory.
+    Landlock,
     /// Create the sandbox using Linux namespaces.
     Namespace,
     /// Create the sandbox using chroot.
@@ -135,6 +146,7 @@ impl FromStr for SandboxMode {
     type Err = &'static str;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
+            "landlock" => Ok(SandboxMode::Landlock),
             "namespace" => Ok(SandboxMode::Namespace),
             "chroot" => Ok(SandboxMode::Chroot),
             "none" => Ok(SandboxMode::None),
@@ -612,6 +624,63 @@ impl Sandbox {
         Ok(())
     }
 
+    /// Restrict the current process with Landlock to only allow access to the shared directory.
+    /// The restriction is best-effort, meaning that all access right rules supported by the
+    /// current Landlock version will be enforced.
+    pub fn enter_landlock(&mut self) -> Result<(), Error> {
+        use landlock::{abi_version, add_rule, create_ruleset, restrict_process, LandlockAccessFs};
+
+        self.save_fds()?;
+
+        // Define which rules we want to be able to handle.
+        let mut access_rights = LandlockAccessFs::EXECUTE
+            | LandlockAccessFs::WRITE_FILE
+            | LandlockAccessFs::READ_FILE
+            | LandlockAccessFs::READ_DIR
+            | LandlockAccessFs::REMOVE_DIR
+            | LandlockAccessFs::REMOVE_FILE
+            | LandlockAccessFs::MAKE_CHAR
+            | LandlockAccessFs::MAKE_DIR
+            | LandlockAccessFs::MAKE_REG
+            | LandlockAccessFs::MAKE_SOCK
+            | LandlockAccessFs::MAKE_FIFO
+            | LandlockAccessFs::MAKE_BLOCK
+            | LandlockAccessFs::MAKE_SYM
+            | LandlockAccessFs::REFER
+            | LandlockAccessFs::TRUNCATE;
+
+        // Check Landlock ABI.
+        let abi = abi_version()?;
+        debug!("Detected Landlock v{}", abi);
+        // Remove unsupported rules with respect to Landlock ABI.
+        match abi {
+            1 => {
+                access_rights.remove(LandlockAccessFs::REFER);
+                access_rights.remove(LandlockAccessFs::TRUNCATE);
+            }
+            2 => {
+                access_rights.remove(LandlockAccessFs::TRUNCATE);
+            }
+            _ => (),
+        }
+
+        // Create ruleset with the rules we want to be able to handle.
+        // The ruleset is initially empty, i.e., contains no enforced rules.
+        let ruleset_fd = create_ruleset(access_rights, 0)?;
+
+        // Those are not needed
+        access_rights.remove(LandlockAccessFs::EXECUTE);
+
+        // Add access rights for shared directory.
+        add_rule(self.shared_dir.as_str(), access_rights, ruleset_fd.as_fd())?;
+        debug!("Added Landlock rule for {}", self.shared_dir);
+
+        restrict_process(ruleset_fd)?;
+        debug!("Landlock'ed!");
+
+        Ok(())
+    }
+
     /// Set up sandbox,
     pub fn enter(&mut self, listener: Listener) -> Result<Listener, Error> {
         let uid = unsafe { libc::geteuid() };
@@ -653,6 +722,7 @@ impl Sandbox {
         match self.sandbox_mode {
             SandboxMode::Namespace => self.enter_namespace(listener),
             SandboxMode::Chroot => self.enter_chroot().and(Ok(listener)),
+            SandboxMode::Landlock => self.enter_landlock().and(Ok(listener)),
             SandboxMode::None => Ok(listener),
         }
     }
@@ -668,7 +738,7 @@ impl Sandbox {
     pub fn get_root_dir(&self) -> String {
         match self.sandbox_mode {
             SandboxMode::Namespace | SandboxMode::Chroot => "/".to_string(),
-            SandboxMode::None => self.shared_dir.clone(),
+            SandboxMode::Landlock | SandboxMode::None => self.shared_dir.clone(),
         }
     }
 
@@ -676,7 +746,7 @@ impl Sandbox {
     /// accessible in our sandbox
     pub fn get_mountinfo_prefix(&self) -> Option<String> {
         match self.sandbox_mode {
-            SandboxMode::Namespace | SandboxMode::None => None,
+            SandboxMode::Landlock | SandboxMode::Namespace | SandboxMode::None => None,
             SandboxMode::Chroot => Some(self.shared_dir.clone()),
         }
     }
