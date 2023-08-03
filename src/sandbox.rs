@@ -47,6 +47,13 @@ pub enum Error {
     /// Error mounting target directory.
     MountTarget(io::Error),
     /// Failed to open `/proc/self/mountinfo`.
+    /// Error mounting tmpfs.
+    MountTmpFs(io::Error),
+    /// Error mounting lib.
+    MountLib(io::Error),
+    /// Error mounting lib64.
+    MountLib64(io::Error),
+    /// Failed to open `/proc/self/mountinfo`.
     OpenMountinfo(io::Error),
     /// Failed to open new root.
     OpenNewRoot(io::Error),
@@ -120,6 +127,8 @@ impl fmt::Display for Error {
 /// Mechanism to be used for setting up the sandbox.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SandboxMode {
+    /// The sandbox has been created by the external tool.
+    External,
     /// Create the sandbox using Linux namespaces.
     Namespace,
     /// Create the sandbox using chroot.
@@ -132,6 +141,7 @@ impl FromStr for SandboxMode {
     type Err = &'static str;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
+            "external" => Ok(SandboxMode::External),
             "namespace" => Ok(SandboxMode::Namespace),
             "chroot" => Ok(SandboxMode::Chroot),
             "none" => Ok(SandboxMode::None),
@@ -308,8 +318,7 @@ impl Sandbox {
     }
 
     /// Sets mappings for the given uid and gid.
-    fn setup_id_mappings(
-        &self,
+    pub fn setup_id_mappings(
         uid_map: Option<&UidMap>,
         gid_map: Option<&GidMap>,
         pid: i32,
@@ -403,7 +412,7 @@ impl Sandbox {
             if uid != 0 {
                 let ppid = unsafe { libc::getppid() };
                 if let Err(why) =
-                    self.setup_id_mappings(self.uid_map.as_ref(), self.gid_map.as_ref(), ppid)
+                    Self::setup_id_mappings(self.uid_map.as_ref(), self.gid_map.as_ref(), ppid)
                 {
                     panic!("couldn't setup id mappings: {}", why)
                 };
@@ -538,14 +547,14 @@ impl Sandbox {
         // supplementary groups even if wanted to. Only way to do this
         // will be to use newuidmap/newgidmap to setup user namespace
         // which will allow setgroups().
-        if uid == 0 {
+        if uid == 0 && self.sandbox_mode != SandboxMode::External {
             self.drop_supplemental_groups()?;
         }
 
         match self.sandbox_mode {
             SandboxMode::Namespace => self.enter_namespace(),
             SandboxMode::Chroot => self.enter_chroot(),
-            SandboxMode::None => Ok(()),
+            SandboxMode::None | SandboxMode::External => Ok(()),
         }
     }
 
@@ -559,7 +568,7 @@ impl Sandbox {
 
     pub fn get_root_dir(&self) -> String {
         match self.sandbox_mode {
-            SandboxMode::Namespace | SandboxMode::Chroot => "/".to_string(),
+            SandboxMode::External | SandboxMode::Namespace | SandboxMode::Chroot => "/".to_string(),
             SandboxMode::None => self.shared_dir.clone(),
         }
     }
@@ -568,7 +577,7 @@ impl Sandbox {
     /// accessible in our sandbox
     pub fn get_mountinfo_prefix(&self) -> Option<String> {
         match self.sandbox_mode {
-            SandboxMode::Namespace | SandboxMode::None => None,
+            SandboxMode::External | SandboxMode::Namespace | SandboxMode::None => None,
             SandboxMode::Chroot => Some(self.shared_dir.clone()),
         }
     }

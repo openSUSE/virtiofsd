@@ -9,6 +9,7 @@ use passthrough::xattrmap::XattrMap;
 use std::collections::HashSet;
 use std::convert::{self, TryFrom, TryInto};
 use std::ffi::CString;
+use std::fs::File;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::Path;
 use std::str::FromStr;
@@ -507,6 +508,12 @@ struct Opt {
     #[structopt(long, required_unless_one = &["socket", "socket-path", "print-capabilities"], conflicts_with_all = &["sock", "socket"])]
     fd: Option<RawFd>,
 
+    #[structopt(long)]
+    proc_self_fd: Option<RawFd>,
+
+    #[structopt(long)]
+    proc_self_mountinfo: Option<RawFd>,
+
     /// Maximum thread pool size. A value of "0" disables the pool
     #[structopt(long, default_value = "0")]
     thread_pool_size: usize,
@@ -939,6 +946,11 @@ fn main() {
             | libc::S_IXOTH
     };
 
+    limits::setup_rlimit_nofile(opt.rlimit_nofile).unwrap_or_else(|error| {
+        error!("Error increasing number of open files: {}", error);
+        process::exit(1)
+    });
+
     // We need to keep _pid_file around because it maintains a lock on the pid file
     // that prevents another daemon from using the same pid file.
     let (listener, socket_path, _pid_file) = match opt.fd.as_ref() {
@@ -988,14 +1000,9 @@ fn main() {
         }
     }
 
-    limits::setup_rlimit_nofile(opt.rlimit_nofile).unwrap_or_else(|error| {
-        error!("Error increasing number of open files: {}", error);
-        process::exit(1)
-    });
-
     let mut sandbox = Sandbox::new(
         shared_dir.to_string(),
-        sandbox_mode,
+        sandbox_mode.clone(),
         opt.uid_map,
         opt.gid_map,
     )
@@ -1011,6 +1018,22 @@ fn main() {
         process::exit(1)
     });
 
+    let (proc_sfd_rawfd, proc_mountinfo_rawfd) = match sandbox_mode {
+        SandboxMode::External => {
+            if opt.proc_self_fd.is_none() && opt.proc_self_mountinfo.is_none() {
+                error!("`--sandbox external` requires `--proc-self-fd [fd]` and `--proc-self-mountinfo [fd]`");
+                process::exit(1);
+            }
+            let proc_sfd_rawfd = opt.proc_self_fd.map(|fd| unsafe { File::from_raw_fd(fd) });
+            let proc_mountinfo_rawfd = opt
+                .proc_self_mountinfo
+                .map(|fd| unsafe { File::from_raw_fd(fd) });
+
+            (proc_sfd_rawfd, proc_mountinfo_rawfd)
+        }
+        _ => (sandbox.get_proc_self_fd(), sandbox.get_mountinfo_fd()),
+    };
+
     let fs_cfg = passthrough::Config {
         entry_timeout: timeout,
         attr_timeout: timeout,
@@ -1019,8 +1042,8 @@ fn main() {
         mountinfo_prefix: sandbox.get_mountinfo_prefix(),
         xattr,
         xattrmap,
-        proc_sfd_rawfd: sandbox.get_proc_self_fd(),
-        proc_mountinfo_rawfd: sandbox.get_mountinfo_fd(),
+        proc_sfd_rawfd,
+        proc_mountinfo_rawfd,
         announce_submounts,
         inode_file_handles: opt.inode_file_handles.into(),
         readdirplus,
