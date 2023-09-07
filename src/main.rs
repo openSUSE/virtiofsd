@@ -1043,9 +1043,10 @@ fn main() {
     }
 
     // We don't modify the capabilities if the user call us without
-    // any sandbox (i.e. --sandbox=none) as unprivileged user
+    // any sandbox (i.e. --sandbox=none).  Also, assume that unprivileged
+    // users already have dropped capabilities.
     let uid = unsafe { libc::geteuid() };
-    if uid == 0 {
+    if !sandbox.is_none() && uid == 0 {
         drop_capabilities(fs_cfg.inode_file_handles, opt.modcaps);
     }
 
