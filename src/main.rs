@@ -1020,6 +1020,15 @@ fn main() {
         warn!("Use of deprecated value 'fallback' for '--inode-file-handles': Please use 'prefer' instead");
     }
 
+    let inode_file_handles: InodeFileHandlesMode = opt.inode_file_handles.into();
+    // virtiofsd currently checks whether file handles work by opening the root directory and turning it into a file handle.
+    // With Landlock sandboxing, we don't have permission to access the root directory.
+    // Therefore, print an error and exit if file handles are enabled through the command argument.
+    if opt.sandbox == SandboxMode::Landlock && inode_file_handles != InodeFileHandlesMode::Never {
+        error!("Landlock sandboxing does not support file handles");
+        process::exit(1);
+    }
+
     let xattrmap = opt.xattrmap.clone();
     let xattr = xattrmap.is_some() || opt.posix_acl || opt.xattr;
     let thread_pool_size = opt.thread_pool_size;
@@ -1129,7 +1138,7 @@ fn main() {
         proc_sfd_rawfd: sandbox.get_proc_self_fd(),
         proc_mountinfo_rawfd: sandbox.get_mountinfo_fd(),
         announce_submounts,
-        inode_file_handles: opt.inode_file_handles.into(),
+        inode_file_handles,
         readdirplus,
         writeback: opt.writeback,
         allow_direct_io: opt.allow_direct_io,
@@ -1143,7 +1152,7 @@ fn main() {
     // Must happen before we start the thread pool
     match opt.seccomp {
         SeccompAction::Allow => {}
-        _ => enable_seccomp(opt.seccomp, opt.syslog).unwrap(),
+        _ => enable_seccomp(opt.seccomp, opt.syslog, inode_file_handles).unwrap(),
     }
 
     // We don't modify the capabilities if the user call us without

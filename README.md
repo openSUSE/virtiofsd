@@ -226,8 +226,10 @@ interpreted as two options, instead of the intended `--modcaps=-mknod`.
 ```shell
 --sandbox <sandbox>
 ```
-Sandbox mechanism to isolate the daemon process (namespace, chroot, none).
+Sandbox mechanism to isolate the daemon process (landlock, namespace, chroot, none).
 
+- **landlock**: The program restricts itself with Landlock ([https://landlock.io/](https://landlock.io/)), a Linux kernel security feature.
+The restriction is best-effort, meaning that it will enable all available access right rules of the Landlock version found on the system.
 - **namespace**: The program switches into a new file system
 namespace (`namespaces(7)`) and invokes `pivot_root(2)` to make the shared directory
 tree its root. A new mount (`mount_namespaces(7)`), pid (`pid_namespaces(7)`) and

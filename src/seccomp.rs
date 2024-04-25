@@ -9,6 +9,8 @@ use libseccomp_sys::{
 use std::convert::TryInto;
 use std::{error, fmt};
 
+use crate::passthrough::InodeFileHandlesMode;
+
 #[derive(Debug)]
 pub enum Error {
     /// Error allowing a syscall
@@ -58,7 +60,11 @@ macro_rules! allow_syscall {
     };
 }
 
-pub fn enable_seccomp(action: SeccompAction, allow_remote_logging: bool) -> Result<(), Error> {
+pub fn enable_seccomp(
+    action: SeccompAction,
+    allow_remote_logging: bool,
+    inode_file_handles: InodeFileHandlesMode,
+) -> Result<(), Error> {
     let ctx = unsafe { seccomp_init(action.into()) };
     if ctx.is_null() {
         return Err(Error::InitSeccompContext);
@@ -150,7 +156,9 @@ pub fn enable_seccomp(action: SeccompAction, allow_remote_logging: bool) -> Resu
     allow_syscall!(ctx, libc::SYS_open);
     allow_syscall!(ctx, libc::SYS_openat);
     allow_syscall!(ctx, libc::SYS_openat2);
-    allow_syscall!(ctx, libc::SYS_open_by_handle_at);
+    if inode_file_handles != InodeFileHandlesMode::Never {
+        allow_syscall!(ctx, libc::SYS_open_by_handle_at);
+    }
     allow_syscall!(ctx, libc::SYS_prctl); // TODO restrict to just PR_SET_NAME?
     allow_syscall!(ctx, libc::SYS_preadv);
     allow_syscall!(ctx, libc::SYS_pread64);
