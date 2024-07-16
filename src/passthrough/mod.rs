@@ -25,6 +25,7 @@ use crate::passthrough::inode_store::{
 };
 use crate::passthrough::util::{ebadf, is_safe_inode, openat, reopen_fd_through_proc};
 use crate::read_dir::ReadDir;
+use crate::soft_idmap::{GuestId, HostGid, HostId, HostUid, Id};
 use crate::util::{other_io_error, ResultErrorContext};
 use crate::{fuse, oslib};
 use file_handle::{FileHandle, FileOrHandle, OpenableFileHandle};
@@ -1405,9 +1406,9 @@ impl PassthroughFs {
         ctx: &Context,
         extensions: &Extensions,
     ) -> io::Result<Option<UnixCredentialsGuard>> {
-        let host_uid = ctx.uid;
-        let host_gid = ctx.gid;
-        let supp_gid = extensions.sup_gid;
+        let host_uid = ctx.uid.id_mapped();
+        let host_gid = ctx.gid.id_mapped();
+        let supp_gid = extensions.sup_gid.map(|gid| gid.id_mapped());
 
         UnixCredentials::new(host_uid, host_gid)
             .supplementary_gid(self.sup_group_extension.load(Ordering::Relaxed), supp_gid)
@@ -1877,13 +1878,13 @@ impl FileSystem for PassthroughFs {
 
         if valid.intersects(SetattrValid::UID | SetattrValid::GID) {
             let uid = if valid.contains(SetattrValid::UID) {
-                attr.uid
+                attr.uid.id_mapped().into_inner()
             } else {
                 // Cannot use -1 here because these are unsigned values.
                 u32::MAX
             };
             let gid = if valid.contains(SetattrValid::GID) {
-                attr.gid
+                attr.gid.id_mapped().into_inner()
             } else {
                 // Cannot use -1 here because these are unsigned values.
                 u32::MAX
@@ -2243,19 +2244,22 @@ impl FileSystem for PassthroughFs {
             return Ok(());
         }
 
+        let st_uid = HostUid::from(st.st_uid).id_mapped();
+        let st_gid = HostGid::from(st.st_gid).id_mapped();
+
         if (mode & libc::R_OK) != 0
-            && ctx.uid != 0
-            && (st.st_uid != ctx.uid || st.st_mode & 0o400 == 0)
-            && (st.st_gid != ctx.gid || st.st_mode & 0o040 == 0)
+            && !ctx.uid.is_root()
+            && (st_uid != ctx.uid || st.st_mode & 0o400 == 0)
+            && (st_gid != ctx.gid || st.st_mode & 0o040 == 0)
             && st.st_mode & 0o004 == 0
         {
             return Err(io::Error::from_raw_os_error(libc::EACCES));
         }
 
         if (mode & libc::W_OK) != 0
-            && ctx.uid != 0
-            && (st.st_uid != ctx.uid || st.st_mode & 0o200 == 0)
-            && (st.st_gid != ctx.gid || st.st_mode & 0o020 == 0)
+            && !ctx.uid.is_root()
+            && (st_uid != ctx.uid || st.st_mode & 0o200 == 0)
+            && (st_gid != ctx.gid || st.st_mode & 0o020 == 0)
             && st.st_mode & 0o002 == 0
         {
             return Err(io::Error::from_raw_os_error(libc::EACCES));
@@ -2264,9 +2268,9 @@ impl FileSystem for PassthroughFs {
         // root can only execute something if it is executable by one of the owner, the group, or
         // everyone.
         if (mode & libc::X_OK) != 0
-            && (ctx.uid != 0 || st.st_mode & 0o111 == 0)
-            && (st.st_uid != ctx.uid || st.st_mode & 0o100 == 0)
-            && (st.st_gid != ctx.gid || st.st_mode & 0o010 == 0)
+            && (!ctx.uid.is_root() || st.st_mode & 0o111 == 0)
+            && (st_uid != ctx.uid || st.st_mode & 0o100 == 0)
+            && (st_gid != ctx.gid || st.st_mode & 0o010 == 0)
             && st.st_mode & 0o001 == 0
         {
             return Err(io::Error::from_raw_os_error(libc::EACCES));
