@@ -19,6 +19,7 @@ pub mod read_dir;
 pub mod sandbox;
 pub mod seccomp;
 pub mod server;
+pub mod soft_idmap;
 pub mod util;
 
 use std::ffi::{FromBytesWithNulError, FromVecWithNulError};
