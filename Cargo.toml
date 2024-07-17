@@ -17,6 +17,7 @@ xen = ["vhost-user-backend/xen", "vhost/xen", "vm-memory/xen"]
 
 [dependencies]
 bitflags = "1.2"
+btree-range-map = "0.7"
 capng = "0.2.2"
 env_logger = "0.8.4"
 futures = { version = "0.3", features = ["thread-pool"] }
