@@ -1018,12 +1018,7 @@ impl PassthroughFs {
             // on write
             Some(xattrname) => {
                 // No need to do anything for non-regular files.
-                let mut stat = MaybeUninit::<libc::stat>::zeroed();
-                let res = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
-                if res != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                let stat = unsafe { stat.assume_init() };
+                let stat = statx(&fd, None)?.st;
                 if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
                     return Ok(());
                 }
