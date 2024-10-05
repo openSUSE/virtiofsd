@@ -963,8 +963,8 @@ impl PassthroughFs {
 
         // Filter out POSIX ACL xattrs if not enabled.
         if !self.posix_acl.load(Ordering::Relaxed)
-            && (name.starts_with("system.posix_acl_access".as_bytes())
-                || name.starts_with("system.posix_acl_default".as_bytes()))
+            && (name == "system.posix_acl_access".as_bytes()
+                || name == "system.posix_acl_default".as_bytes())
         {
             return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
         }
