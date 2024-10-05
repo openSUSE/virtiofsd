@@ -978,7 +978,7 @@ impl PassthroughFs {
         }
     }
 
-    fn map_server_xattrlist(&self, xattr_names: Vec<u8>) -> Vec<u8> {
+    fn map_server_xattrlist(&self, xattr_names: Vec<u8>, uid: u32) -> Vec<u8> {
         let all_xattrs = match &self.cfg.xattrmap {
             Some(map) => map
                 .map_server_xattrlist(xattr_names)
@@ -986,15 +986,23 @@ impl PassthroughFs {
             None => xattr_names,
         };
 
-        // filter out the blocked xattrs
         let mut filtered = Vec::with_capacity(all_xattrs.len());
         let all_xattrs = all_xattrs.split(|b| *b == 0).filter(|bs| !bs.is_empty());
 
         for xattr in all_xattrs {
-            if !self.block_xattr(xattr) {
-                filtered.extend_from_slice(xattr);
-                filtered.push(0);
+            // Filter out blocked xattrs.
+            if self.block_xattr(xattr) {
+                continue;
             }
+
+            // If not root, filter out trusted and security xattrs similar to what the kernel would
+            // do.
+            if uid != 0 && (xattr.starts_with("trusted.".as_bytes()) || xattr.starts_with("security.".as_bytes())) {
+                continue;
+            }
+
+            filtered.extend_from_slice(xattr);
+            filtered.push(0);
         }
 
         filtered.shrink_to_fit();
@@ -2267,7 +2275,7 @@ impl FileSystem for PassthroughFs {
         }
     }
 
-    fn listxattr(&self, _ctx: Context, inode: Inode, size: u32) -> io::Result<ListxattrReply> {
+    fn listxattr(&self, ctx: Context, inode: Inode, size: u32) -> io::Result<ListxattrReply> {
         if !self.cfg.xattr {
             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
         }
@@ -2314,7 +2322,7 @@ impl FileSystem for PassthroughFs {
             Ok(ListxattrReply::Count(res as u32))
         } else {
             buf.resize(res as usize, 0);
-            let buf = self.map_server_xattrlist(buf);
+            let buf = self.map_server_xattrlist(buf, ctx.uid);
             Ok(ListxattrReply::Names(buf))
         }
     }
