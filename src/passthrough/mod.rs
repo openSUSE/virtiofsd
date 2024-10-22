@@ -1831,7 +1831,6 @@ impl FileSystem for PassthroughFs {
         handle: Option<Handle>,
         valid: SetattrValid,
     ) -> io::Result<(fuse::Attr, Duration)> {
-        let attr = libc::stat64::from(attr);
         let inode_data = self.inodes.get(inode).ok_or_else(ebadf)?;
 
         // In this case, we need to open a new O_RDWR FD
@@ -1865,9 +1864,9 @@ impl FileSystem for PassthroughFs {
             // Safe because this doesn't modify any memory and we check the return value.
             let res = unsafe {
                 match data {
-                    Data::Handle(_, fd) => libc::fchmod(fd, attr.st_mode),
+                    Data::Handle(_, fd) => libc::fchmod(fd, attr.mode),
                     Data::ProcPath(ref p) => {
-                        libc::fchmodat(self.proc_self_fd.as_raw_fd(), p.as_ptr(), attr.st_mode, 0)
+                        libc::fchmodat(self.proc_self_fd.as_raw_fd(), p.as_ptr(), attr.mode, 0)
                     }
                 }
             };
@@ -1878,13 +1877,13 @@ impl FileSystem for PassthroughFs {
 
         if valid.intersects(SetattrValid::UID | SetattrValid::GID) {
             let uid = if valid.contains(SetattrValid::UID) {
-                attr.st_uid
+                attr.uid
             } else {
                 // Cannot use -1 here because these are unsigned values.
                 u32::MAX
             };
             let gid = if valid.contains(SetattrValid::GID) {
-                attr.st_gid
+                attr.gid
             } else {
                 // Cannot use -1 here because these are unsigned values.
                 u32::MAX
@@ -1930,7 +1929,7 @@ impl FileSystem for PassthroughFs {
             // Safe because this doesn't modify any memory and we check the return value.
             let res = self
                 .clear_file_capabilities(fd, false)
-                .map(|_| unsafe { libc::ftruncate(fd, attr.st_size) })?;
+                .map(|_| unsafe { libc::ftruncate(fd, attr.size as i64) })?;
             if res < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -1951,15 +1950,15 @@ impl FileSystem for PassthroughFs {
             if valid.contains(SetattrValid::ATIME_NOW) {
                 tvs[0].tv_nsec = libc::UTIME_NOW;
             } else if valid.contains(SetattrValid::ATIME) {
-                tvs[0].tv_sec = attr.st_atime;
-                tvs[0].tv_nsec = attr.st_atime_nsec;
+                tvs[0].tv_sec = attr.atime as i64;
+                tvs[0].tv_nsec = attr.atimensec.into();
             }
 
             if valid.contains(SetattrValid::MTIME_NOW) {
                 tvs[1].tv_nsec = libc::UTIME_NOW;
             } else if valid.contains(SetattrValid::MTIME) {
-                tvs[1].tv_sec = attr.st_mtime;
-                tvs[1].tv_nsec = attr.st_mtime_nsec;
+                tvs[1].tv_sec = attr.mtime as i64;
+                tvs[1].tv_nsec = attr.mtimensec.into();
             }
 
             // Safe because this doesn't modify any memory and we check the return value.
