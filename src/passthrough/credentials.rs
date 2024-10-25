@@ -5,6 +5,32 @@ use crate::passthrough::util::einval;
 use crate::soft_idmap::{HostGid, HostUid, Id};
 use std::io;
 
+/// Add a capability to the effective set
+/// # Errors
+/// An error variant will be returned:
+/// - if the input string does not match the name, without the 'CAP_' prefix, of any of the
+///   capabilities defined in `linux/capabiliy.h`.
+/// - if `capng::get_caps_process()` cannot get the capabilities and bounding set of the process.
+/// - if `capng::update()` fails to update the internal posix capabilities settings.
+/// - if `capng::apply()` fails to transfer the specified internal posix capabilities settings to
+///   the kernel.
+fn add_cap_to_eff(cap_name: &str) -> capng::Result<()> {
+    use capng::{Action, CUpdate, Set, Type};
+    let cap = capng::name_to_capability(cap_name)?;
+    capng::get_caps_process()?;
+
+    let req = vec![CUpdate {
+        action: Action::ADD,
+        cap_type: Type::EFFECTIVE,
+        capability: cap,
+    }];
+
+    capng::update(req)?;
+    capng::apply(Set::CAPS)?;
+
+    Ok(())
+}
+
 pub struct UnixCredentials {
     uid: HostUid,
     gid: HostGid,
@@ -68,7 +94,7 @@ impl UnixCredentials {
             // user ID, so we still have the 'DAC_OVERRIDE' in the permitted set.
             // After switching back to root the permitted set is copied to the effective set,
             // so no additional steps are required.
-            if let Err(e) = crate::util::add_cap_to_eff("DAC_OVERRIDE") {
+            if let Err(e) = add_cap_to_eff("DAC_OVERRIDE") {
                 warn!("failed to add 'DAC_OVERRIDE' to the effective set of capabilities: {e}");
             }
         }
