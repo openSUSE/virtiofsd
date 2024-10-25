@@ -25,7 +25,7 @@ required-features = ["seccomp"]
 [dependencies]
 bitflags = "1.2"
 btree-range-map = "0.7"
-capng = "0.2.2"
+capctl = "0.2.4"
 env_logger = "0.8.4"
 futures = { version = "0.3", features = ["thread-pool"] }
 libc = "0.2.155"
