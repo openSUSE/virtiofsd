@@ -47,12 +47,12 @@ pub struct Entry {
 impl From<Entry> for fuse::EntryOut {
     fn from(entry: Entry) -> fuse::EntryOut {
         fuse::EntryOut {
-            nodeid: entry.inode,
-            generation: entry.generation,
-            entry_valid: entry.entry_timeout.as_secs(),
-            attr_valid: entry.attr_timeout.as_secs(),
-            entry_valid_nsec: entry.entry_timeout.subsec_nanos(),
-            attr_valid_nsec: entry.attr_timeout.subsec_nanos(),
+            nodeid: entry.inode.into(),
+            generation: entry.generation.into(),
+            entry_valid: entry.entry_timeout.as_secs().into(),
+            attr_valid: entry.attr_timeout.as_secs().into(),
+            entry_valid_nsec: entry.entry_timeout.subsec_nanos().into(),
+            attr_valid_nsec: entry.attr_timeout.subsec_nanos().into(),
             attr: entry.attr,
         }
     }
@@ -194,9 +194,9 @@ pub struct Context {
 impl From<fuse::InHeader> for Context {
     fn from(source: fuse::InHeader) -> Self {
         Context {
-            uid: source.uid,
-            gid: source.gid,
-            pid: source.pid as i32,
+            uid: source.uid.into(),
+            gid: source.gid.into(),
+            pid: source.pid.from_guest() as i32,
         }
     }
 }
