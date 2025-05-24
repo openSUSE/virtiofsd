@@ -182,6 +182,28 @@ impl Sandbox {
         })
     }
 
+    // Open descriptors for get_proc_self_fd() and get_mountinfo_fd()
+    fn save_fds(&mut self) -> Result<(), Error> {
+        let c_proc_self_fd = CString::new("/proc/self/fd").unwrap();
+        let proc_self_fd =
+            unsafe { libc::open(c_proc_self_fd.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        if proc_self_fd < 0 {
+            return Err(Error::OpenProcSelfFd(std::io::Error::last_os_error()));
+        }
+        // Safe because we just opened this fd.
+        self.proc_self_fd = Some(unsafe { File::from_raw_fd(proc_self_fd) });
+
+        let c_mountinfo = CString::new("/proc/self/mountinfo").unwrap();
+        let mountinfo_fd =
+            unsafe { libc::open(c_mountinfo.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if mountinfo_fd < 0 {
+            return Err(Error::OpenMountinfo(std::io::Error::last_os_error()));
+        }
+        // Safe because we just opened this fd.
+        self.mountinfo_fd = Some(unsafe { File::from_raw_fd(mountinfo_fd) });
+        Ok(())
+    }
+
     // Make `self.shared_dir` our root directory, and get isolated file descriptors for
     // `/proc/self/fd` and '/proc/self/mountinfo`.
     //
@@ -527,22 +549,7 @@ impl Sandbox {
     }
 
     pub fn enter_chroot(&mut self) -> Result<(), Error> {
-        let c_proc_self_fd = CString::new("/proc/self/fd").unwrap();
-        let proc_self_fd = unsafe { libc::open(c_proc_self_fd.as_ptr(), libc::O_PATH) };
-        if proc_self_fd < 0 {
-            return Err(Error::OpenProcSelfFd(std::io::Error::last_os_error()));
-        }
-        // Safe because we just opened this fd.
-        self.proc_self_fd = Some(unsafe { File::from_raw_fd(proc_self_fd) });
-
-        let c_mountinfo = CString::new("/proc/self/mountinfo").unwrap();
-        let mountinfo_fd = unsafe { libc::open(c_mountinfo.as_ptr(), libc::O_RDONLY) };
-        if mountinfo_fd < 0 {
-            return Err(Error::OpenMountinfo(std::io::Error::last_os_error()));
-        }
-        // Safe because we just opened this fd.
-        self.mountinfo_fd = Some(unsafe { File::from_raw_fd(mountinfo_fd) });
-
+        self.save_fds()?;
         let c_shared_dir = CString::new(self.shared_dir.clone()).unwrap();
         let ret = unsafe { libc::chroot(c_shared_dir.as_ptr()) };
         if ret != 0 {
