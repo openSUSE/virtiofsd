@@ -12,11 +12,12 @@ readme = "README.md"
 exclude = [".gitlab-ci.yml"]
 
 [features]
-default = ["seccomp"]
+default = ["seccomp", "iouring"]
 # Expose seccomp bindings from the library.
 seccomp = ["dep:libseccomp-sys"]
 # Enabling Xen support will _disable_ QEMU/KVM support!
 xen = ["vhost-user-backend/xen", "vhost/xen", "vm-memory/xen"]
+iouring = ["dep:async-trait"]
 
 [[bin]]
 name = "virtiofsd"
@@ -41,6 +42,7 @@ vm-memory = { version = "0.16.0", features = ["backend-mmap", "backend-atomic"] 
 virtio-queue = "0.14.0"
 vmm-sys-util = "0.12.1"
 syslog = "6.1"
+async-trait = { version = "0.1.88", optional = true }
 
 [profile.release]
 lto = true
