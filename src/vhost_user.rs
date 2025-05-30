@@ -6,7 +6,8 @@ use std::convert::TryInto;
 use std::fs::File;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::thread::{self, JoinHandle};
+use std::thread::{self, sleep, JoinHandle};
+use std::time::Duration;
 use std::{convert, error, fmt, io};
 
 use futures::executor::{ThreadPool, ThreadPoolBuilder};
@@ -217,9 +218,10 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
             .map_err(|_| Error::IterateQueue)?
             .next()
         {
+            let mut timer = Duration::ZERO;
             if self.rate_limiter.is_some() {
                 let mut lb = self.rate_limiter.as_ref().unwrap().write().unwrap();
-                lb.consume(1);
+                timer = lb.consume(1);
             }
 
             used_any = true;
@@ -233,6 +235,9 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
             let worker_desc = avail_desc.clone();
 
             self.pool.as_ref().unwrap().spawn_ok(async move {
+                if timer != Duration::ZERO {
+                    sleep(timer)
+                }
                 let mem = atomic_mem.memory();
                 let head_index = worker_desc.head_index();
 
@@ -274,8 +279,14 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
 
         for chain in avail_chains {
             if self.rate_limiter.is_some() {
-                let mut lb = self.rate_limiter.as_ref().unwrap().write().unwrap();
-                lb.consume(1);
+                let timer;
+                {
+                    let mut lb = self.rate_limiter.as_ref().unwrap().write().unwrap();
+                    timer = lb.consume(1);
+                }
+                if timer != Duration::ZERO {
+                    sleep(timer)
+                }
             }
 
             used_any = true;

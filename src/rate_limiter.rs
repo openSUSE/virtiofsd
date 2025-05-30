@@ -5,7 +5,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 /// Leaky bucket controlling rate limit
@@ -36,13 +35,12 @@ impl LeakyBucket {
 
     /// Compute the duration that we should wait before another account
     fn compute_timer(&mut self) -> Duration {
-        let elapse = Instant::now()
-            .duration_since(self.last_access)
-            .as_secs_f64();
+        let now = Instant::now();
+        let elapse = now.duration_since(self.last_access).as_secs_f64();
 
         self.level = 0.0_f64.max(self.level - self.rate * elapse);
 
-        self.last_access = Instant::now();
+        self.last_access = now;
         if self.level > self.size {
             return Duration::from_secs_f64((self.level - self.size) / self.rate);
         }
@@ -54,12 +52,9 @@ impl LeakyBucket {
         self.level += amount as f64;
     }
 
-    pub fn consume(&mut self, amount: u64) {
+    pub fn consume(&mut self, amount: u64) -> Duration {
         self.account(amount);
-        let timer = self.compute_timer();
-        if timer != Duration::ZERO {
-            sleep(timer)
-        }
+        self.compute_timer()
     }
 }
 

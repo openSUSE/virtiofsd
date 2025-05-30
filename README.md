@@ -493,9 +493,9 @@ This parameter is ignored on the destination side of migration.
 ```shell
 --fs-ops-limit <fs-ops-limit>
 ```
-Rate limiting parameter, a throttling of fs-ops-limit operations per second will be applied if set.
-Note that this affects FUSE requests emitted by the VM, which is not equal to data operations.
-No throttling is applied if this parameter is not set or set to 0.
+If set, this parameter throttles operations per second.
+This limit applies to FUSE requests emitted by the VM, which may not correspond directly to data operations.
+No throttling is applied if not set or set to 0.
 
 ### Examples
 Export `/mnt` on vhost-user UNIX domain socket `/tmp/vfsd.sock`:
