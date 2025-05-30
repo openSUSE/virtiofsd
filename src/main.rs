@@ -395,6 +395,10 @@ struct Opt {
     /// This parameter is ignored on the destination side.
     #[arg(long = "migration-confirm-paths")]
     migration_confirm_paths: bool,
+
+    /// The throttling that should be applied
+    #[arg(long = "fs-ops-limit", default_value = "0")]
+    fs_ops_limit: u64,
 }
 
 fn parse_compat(opt: Opt) -> Opt {
@@ -835,13 +839,13 @@ fn main() {
             error!("Failed to create internal filesystem representation: {e}");
             process::exit(1);
         });
-        run_generic_fs(fs, listener, thread_pool_size, opt.tag);
+        run_generic_fs(fs, listener, thread_pool_size, opt.tag, opt.fs_ops_limit);
     } else {
         let fs = PassthroughFs::new(fs_cfg).unwrap_or_else(|e| {
             error!("Failed to create internal filesystem representation: {e}");
             process::exit(1);
         });
-        run_generic_fs(fs, listener, thread_pool_size, opt.tag);
+        run_generic_fs(fs, listener, thread_pool_size, opt.tag, opt.fs_ops_limit);
     }
 }
 
@@ -851,11 +855,13 @@ fn run_generic_fs<F: FileSystem + SerializableFileSystem + Send + Sync + 'static
     listener: Listener,
     thread_pool_size: usize,
     tag: Option<String>,
+    rate: u64,
 ) {
     let fs_backend = Arc::new(
         VhostUserFsBackendBuilder::default()
             .set_thread_pool_size(thread_pool_size)
             .set_tag(tag)
+            .set_rate(rate)
             .build(fs)
             .unwrap_or_else(|error| {
                 error!("Error creating vhost-user backend: {error}");

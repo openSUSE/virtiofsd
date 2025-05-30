@@ -30,6 +30,7 @@ use vmm_sys_util::eventfd::EventFd;
 
 use crate::descriptor_utils::{Error as VufDescriptorError, Reader, Writer};
 use crate::filesystem::{FileSystem, SerializableFileSystem};
+use crate::rate_limiter::LeakyBucket;
 use crate::server::Server;
 use crate::util::other_io_error;
 use crate::Error as VhostUserFsError;
@@ -121,10 +122,11 @@ struct VhostUserFsThread<F: FileSystem + Send + Sync + 'static> {
     vu_req: Option<Backend>,
     event_idx: bool,
     pool: Option<ThreadPool>,
+    rate_limiter: Option<RwLock<LeakyBucket>>,
 }
 
 impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFsThread<F> {
-    fn new(fs: F, thread_pool_size: usize) -> Result<Self> {
+    fn new(fs: F, thread_pool_size: usize, rate: u64) -> Result<Self> {
         let pool = if thread_pool_size > 0 {
             // Test that unshare(CLONE_FS) works, it will be called for each thread.
             // It's an unprivileged system call but some Docker/Moby versions are
@@ -152,6 +154,12 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
             None
         };
 
+        let rate_limiter = if rate > 0 {
+            Some(RwLock::new(LeakyBucket::new(rate)))
+        } else {
+            None
+        };
+
         Ok(VhostUserFsThread {
             mem: None,
             kill_evt: EventFd::new(EFD_NONBLOCK).map_err(Error::CreateKillEventFd)?,
@@ -159,6 +167,7 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
             vu_req: None,
             event_idx: false,
             pool,
+            rate_limiter,
         })
     }
 
@@ -208,6 +217,11 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
             .map_err(|_| Error::IterateQueue)?
             .next()
         {
+            if self.rate_limiter.is_some() {
+                let mut lb = self.rate_limiter.as_ref().unwrap().write().unwrap();
+                lb.consume(1);
+            }
+
             used_any = true;
 
             // Prepare a set of objects that can be moved to the worker thread.
@@ -259,6 +273,11 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
             .collect();
 
         for chain in avail_chains {
+            if self.rate_limiter.is_some() {
+                let mut lb = self.rate_limiter.as_ref().unwrap().write().unwrap();
+                lb.consume(1);
+            }
+
             used_any = true;
 
             let head_index = chain.head_index();
@@ -393,6 +412,7 @@ struct PremigrationThread {
 pub struct VhostUserFsBackendBuilder {
     thread_pool_size: usize,
     tag: Option<String>,
+    rate: u64,
 }
 
 impl VhostUserFsBackendBuilder {
@@ -417,13 +437,25 @@ impl VhostUserFsBackendBuilder {
     where
         F: FileSystem + SerializableFileSystem + Send + Sync + 'static,
     {
-        let thread = RwLock::new(VhostUserFsThread::new(fs, self.thread_pool_size)?);
+        let thread = RwLock::new(VhostUserFsThread::new(
+            fs,
+            self.thread_pool_size,
+            self.rate,
+        )?);
         Ok(VhostUserFsBackend {
             thread,
             premigration_thread: None.into(),
             migration_thread: None.into(),
             tag: self.tag,
         })
+    }
+
+    /// Adjust the rate.
+    ///
+    /// A value of `0` disables rate limiting.
+    pub fn set_rate(mut self, rate: u64) -> Self {
+        self.rate = rate;
+        self
     }
 }
 

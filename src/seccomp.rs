@@ -202,6 +202,9 @@ pub fn enable_seccomp(action: SeccompAction, allow_remote_logging: bool) -> Resu
     allow_syscall!(ctx, libc::SYS_utimensat);
     allow_syscall!(ctx, libc::SYS_write);
     allow_syscall!(ctx, libc::SYS_writev);
+    // Required by Leaky Bucket
+    allow_syscall!(ctx, libc::SYS_nanosleep);
+    allow_syscall!(ctx, libc::SYS_clock_nanosleep);
 
     if allow_remote_logging {
         allow_syscall!(ctx, libc::SYS_sendto); // Required by syslog
