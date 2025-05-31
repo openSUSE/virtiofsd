@@ -929,7 +929,7 @@ impl PassthroughFs {
 
         let file = {
             let _killpriv_guard = if self.cfg.killpriv_v2 && kill_priv {
-                drop_effective_cap("FSETID")?
+                drop_effective_cap(capctl::Cap::FSETID)?
             } else {
                 None
             };
@@ -1832,7 +1832,7 @@ impl FileSystem for PassthroughFs {
                 // We need to drop FSETID during a write so that the kernel will remove setuid
                 // or setgid bits from the file if it was written to by someone other than the
                 // owner.
-                drop_effective_cap("FSETID")?
+                drop_effective_cap(capctl::Cap::FSETID)?
             } else {
                 None
             };
@@ -1958,7 +1958,7 @@ impl FileSystem for PassthroughFs {
 
             let _killpriv_guard =
                 if self.cfg.killpriv_v2 && valid.contains(SetattrValid::KILL_SUIDGID) {
-                    drop_effective_cap("FSETID")?
+                    drop_effective_cap(capctl::Cap::FSETID)?
                 } else {
                     None
                 };

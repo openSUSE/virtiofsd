@@ -8,20 +8,19 @@ written in Rust.
 ### Requirements
 
 This project depends on
-[libcap-ng](https://people.redhat.com/sgrubb/libcap-ng/) and
 [libseccomp](https://github.com/seccomp/libseccomp). You can obtain
-those dependencies by building them for their respective sources, or
-by installing the correspondent development packages from your
+this dependency by building it from its respective sources, or by
+installing the corresponding development packages from your
 distribution, if available:
 
 - Fedora/CentOS/RHEL
 ```shell
-dnf install libcap-ng-devel libseccomp-devel
+dnf install libseccomp-devel
 ```
 
 - Debian/Ubuntu
 ```shell
-apt install libcap-ng-dev libseccomp-dev
+apt install libseccomp-dev
 ```
 
 ### Compiling

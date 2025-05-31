@@ -12,7 +12,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use std::{env, process};
+use std::{env, io, process};
 use virtiofsd::idmap::{GidMap, UidMap};
 
 use clap::{CommandFactory, Parser};
@@ -28,7 +28,7 @@ use virtiofsd::passthrough::{
 };
 use virtiofsd::sandbox::{Sandbox, SandboxMode};
 use virtiofsd::seccomp::{enable_seccomp, SeccompAction};
-use virtiofsd::util::write_pid_file;
+use virtiofsd::util::{capctl_err_to_io_err, write_pid_file};
 use virtiofsd::vhost_user::{Error, VhostUserFsBackendBuilder, MAX_TAG_LEN};
 use virtiofsd::{limits, oslib, soft_idmap};
 use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
@@ -537,10 +537,10 @@ fn set_signal_handlers() {
 }
 
 fn parse_modcaps(
-    default_caps: Vec<&str>,
+    default_caps: &[capctl::Cap],
     modcaps: Option<String>,
-) -> (HashSet<String>, HashSet<String>) {
-    let mut required_caps: HashSet<String> = default_caps.iter().map(|&s| s.into()).collect();
+) -> (HashSet<capctl::Cap>, HashSet<capctl::Cap>) {
+    let mut required_caps: HashSet<capctl::Cap> = default_caps.iter().copied().collect();
     let mut disabled_caps = HashSet::new();
 
     if let Some(modcaps) = modcaps {
@@ -550,24 +550,30 @@ fn parse_modcaps(
                 process::exit(1);
             }
             let (action, cap_name) = modcap.split_at(1);
-            let cap_name = cap_name.to_uppercase();
             if !matches!(action, "+" | "-") {
                 error!("invalid modcap action: expecting '+'|'-' but found '{action}'");
                 process::exit(1);
             }
-            if let Err(error) = capng::name_to_capability(&cap_name) {
-                error!("invalid capability '{cap_name}': {error}");
-                process::exit(1);
-            }
+
+            let cap_name = cap_name.to_uppercase();
+            // `capctl` prefixes all capability names with `CAP_`, but
+            // we don't.
+            let cap = match capctl::Cap::from_str(&format!("CAP_{cap_name}")) {
+                Ok(cap) => cap,
+                Err(error) => {
+                    error!("invalid capability '{cap_name}': {error}");
+                    process::exit(1);
+                }
+            };
 
             match action {
                 "+" => {
-                    disabled_caps.remove(&cap_name);
-                    required_caps.insert(cap_name);
+                    disabled_caps.remove(&cap);
+                    required_caps.insert(cap);
                 }
                 "-" => {
-                    required_caps.remove(&cap_name);
-                    disabled_caps.insert(cap_name);
+                    required_caps.remove(&cap);
+                    disabled_caps.insert(cap);
                 }
                 _ => unreachable!(),
             }
@@ -576,21 +582,36 @@ fn parse_modcaps(
     (required_caps, disabled_caps)
 }
 
+fn configure_capabilities(required_caps: &HashSet<capctl::Cap>) -> io::Result<()> {
+    // Configure the required set of capabilities for the child, and leave the
+    // parent with none.
+    capctl::caps::bounding::clear().map_err(capctl_err_to_io_err)?;
+    capctl::caps::ambient::clear().map_err(capctl_err_to_io_err)?;
+
+    let mut state = capctl::caps::CapState::empty();
+    for cap in required_caps.iter() {
+        state.effective.add(*cap);
+        state.permitted.add(*cap);
+    }
+    state.set_current().map_err(capctl_err_to_io_err)?;
+    Ok(())
+}
+
 fn drop_capabilities(inode_file_handles: InodeFileHandlesMode, modcaps: Option<String>) {
-    let default_caps = vec![
-        "CHOWN",
-        "DAC_OVERRIDE",
-        "FOWNER",
-        "FSETID",
-        "SETGID",
-        "SETUID",
-        "MKNOD",
-        "SETFCAP",
+    let default_caps = [
+        capctl::Cap::CHOWN,
+        capctl::Cap::DAC_OVERRIDE,
+        capctl::Cap::FOWNER,
+        capctl::Cap::FSETID,
+        capctl::Cap::SETGID,
+        capctl::Cap::SETUID,
+        capctl::Cap::MKNOD,
+        capctl::Cap::SETFCAP,
     ];
-    let (mut required_caps, disabled_caps) = parse_modcaps(default_caps, modcaps);
+    let (mut required_caps, disabled_caps) = parse_modcaps(&default_caps, modcaps);
 
     if inode_file_handles != InodeFileHandlesMode::Never {
-        let required_cap = "DAC_READ_SEARCH".to_owned();
+        let required_cap = capctl::Cap::DAC_READ_SEARCH;
         if disabled_caps.contains(&required_cap) {
             error!("can't disable {required_cap} when using --inode-file-handles={inode_file_handles:?}");
             process::exit(1);
@@ -598,19 +619,8 @@ fn drop_capabilities(inode_file_handles: InodeFileHandlesMode, modcaps: Option<S
         required_caps.insert(required_cap);
     }
 
-    capng::clear(capng::Set::BOTH);
-    // Configure the required set of capabilities for the child, and leave the
-    // parent with none.
-    if let Err(e) = capng::updatev(
-        capng::Action::ADD,
-        capng::Type::PERMITTED | capng::Type::EFFECTIVE,
-        required_caps.iter().map(String::as_str).collect(),
-    ) {
+    if let Err(e) = configure_capabilities(&required_caps) {
         error!("can't set up the child capabilities: {e}");
-        process::exit(1);
-    }
-    if let Err(e) = capng::apply(capng::Set::BOTH) {
-        error!("can't apply the child capabilities: {e}");
         process::exit(1);
     }
 }

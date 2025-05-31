@@ -1,9 +1,20 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use crate::oslib;
-use crate::passthrough::util::einval;
 use crate::soft_idmap::{HostGid, HostUid, Id};
+use crate::util::capctl_err_to_io_err;
 use std::io;
+
+/// Add a capability to the effective set
+/// # Errors
+/// An error variant will be returned:
+/// - if the current capability state cannot be retrieved or updated.
+fn add_cap_to_eff(cap: capctl::Cap) -> io::Result<()> {
+    let mut state = capctl::caps::CapState::get_current().map_err(capctl_err_to_io_err)?;
+    state.effective.add(cap);
+    state.set_current().map_err(capctl_err_to_io_err)?;
+    Ok(())
+}
 
 pub struct UnixCredentials {
     uid: HostUid,
@@ -68,7 +79,7 @@ impl UnixCredentials {
             // user ID, so we still have the 'DAC_OVERRIDE' in the permitted set.
             // After switching back to root the permitted set is copied to the effective set,
             // so no additional steps are required.
-            if let Err(e) = crate::util::add_cap_to_eff("DAC_OVERRIDE") {
+            if let Err(e) = add_cap_to_eff(capctl::Cap::DAC_OVERRIDE) {
                 warn!("failed to add 'DAC_OVERRIDE' to the effective set of capabilities: {e}");
             }
         }
@@ -114,33 +125,15 @@ impl Drop for UnixCredentialsGuard {
 }
 
 pub struct ScopedCaps {
-    cap: capng::Capability,
+    cap: capctl::Cap,
 }
 
 impl ScopedCaps {
-    fn new(cap_name: &str) -> io::Result<Option<Self>> {
-        use capng::{Action, CUpdate, Set, Type};
-
-        let cap = capng::name_to_capability(cap_name).map_err(|_| {
-            let err = io::Error::last_os_error();
-            error!("couldn't get the capability id for name {cap_name}: {err:?}");
-            err
-        })?;
-
-        if capng::have_capability(Type::EFFECTIVE, cap) {
-            let req = vec![CUpdate {
-                action: Action::DROP,
-                cap_type: Type::EFFECTIVE,
-                capability: cap,
-            }];
-            capng::update(req).map_err(|e| {
-                error!("couldn't drop {cap} capability: {e:?}");
-                einval()
-            })?;
-            capng::apply(Set::CAPS).map_err(|e| {
-                error!("couldn't apply capabilities after dropping {cap}: {e:?}");
-                einval()
-            })?;
+    fn new(cap: capctl::Cap) -> io::Result<Option<Self>> {
+        let mut state = capctl::caps::CapState::get_current().map_err(capctl_err_to_io_err)?;
+        if state.effective.has(cap) {
+            state.effective.drop(cap);
+            state.set_current().map_err(capctl_err_to_io_err)?;
             Ok(Some(Self { cap }))
         } else {
             Ok(None)
@@ -150,26 +143,12 @@ impl ScopedCaps {
 
 impl Drop for ScopedCaps {
     fn drop(&mut self) {
-        use capng::{Action, CUpdate, Set, Type};
-
-        let req = vec![CUpdate {
-            action: Action::ADD,
-            cap_type: Type::EFFECTIVE,
-            capability: self.cap,
-        }];
-
-        if let Err(e) = capng::update(req) {
-            panic!("couldn't restore {} capability: {:?}", self.cap, e);
-        }
-        if let Err(e) = capng::apply(Set::CAPS) {
-            panic!(
-                "couldn't apply capabilities after restoring {}: {:?}",
-                self.cap, e
-            );
+        if let Err(e) = add_cap_to_eff(self.cap) {
+            panic!("couldn't restore {} capability: {e:?}", self.cap);
         }
     }
 }
 
-pub fn drop_effective_cap(cap_name: &str) -> io::Result<Option<ScopedCaps>> {
-    ScopedCaps::new(cap_name)
+pub fn drop_effective_cap(cap: capctl::Cap) -> io::Result<Option<ScopedCaps>> {
+    ScopedCaps::new(cap)
 }
