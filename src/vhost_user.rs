@@ -11,6 +11,7 @@ use std::time::Duration;
 use std::{convert, error, fmt, io};
 
 use futures::executor::{ThreadPool, ThreadPoolBuilder};
+use futures_timer::Delay;
 use libc::EFD_NONBLOCK;
 use log::*;
 
@@ -236,7 +237,7 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
 
             self.pool.as_ref().unwrap().spawn_ok(async move {
                 if timer != Duration::ZERO {
-                    sleep(timer)
+                    Delay::new(timer).await;
                 }
                 let mem = atomic_mem.memory();
                 let head_index = worker_desc.head_index();
@@ -461,7 +462,7 @@ impl VhostUserFsBackendBuilder {
         })
     }
 
-    /// Adjust the rate.
+    /// Adjust the rate (requests per second).
     ///
     /// A value of `0` disables rate limiting.
     pub fn set_rate(mut self, rate: u64) -> Self {

@@ -52,6 +52,8 @@ impl LeakyBucket {
         self.level += amount as f64;
     }
 
+    /// Consume specified unit from the bucket.
+    /// It is caller's responsibility to sleep for the output duration.
     pub fn consume(&mut self, amount: u64) -> Duration {
         self.account(amount);
         self.compute_timer()
