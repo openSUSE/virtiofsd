@@ -19,7 +19,7 @@ pub mod xattrmap;
 #[cfg(feature = "iouring")]
 use crate::async_wrappers::{IoUringRuntime, IoUringRuntimeWithEventFd, IoUringState};
 #[cfg(feature = "iouring")]
-use crate::filesystem::filesystem_async::AsyncZeroCopyWriter;
+use crate::filesystem::filesystem_async::{AsyncZeroCopyReader, AsyncZeroCopyWriter};
 use crate::filesystem::{
     Context, Entry, Extensions, FileSystem, FsOptions, GetxattrReply, ListxattrReply, OpenOptions,
     SecContext, SetattrValid, SetxattrFlags, ZeroCopyReader, ZeroCopyWriter,
@@ -2020,6 +2020,36 @@ impl FileSystem for PassthroughFs {
             let flags = (!delayed_write && is_append).then_some(oslib::WritevFlags::RWF_APPEND);
             r.write_to_file_at(f.get_file(), size as usize, offset, flags)
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(feature = "iouring")]
+    async fn write_async<R: AsyncZeroCopyReader + Send>(
+        &self,
+        ctx: Context,
+        inode: <Self as FileSystem>::Inode,
+        handle: <Self as FileSystem>::Handle,
+        r: R,
+        size: u32,
+        offset: u64,
+        lock_owner: Option<u64>,
+        delayed_write: bool,
+        kill_priv: bool,
+        flags: u32,
+    ) -> io::Result<usize> {
+        self.do_write_async(
+            ctx,
+            inode,
+            handle,
+            r,
+            size,
+            offset,
+            lock_owner,
+            delayed_write,
+            kill_priv,
+            flags,
+        )
+        .await
     }
 
     fn getattr(

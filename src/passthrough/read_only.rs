@@ -14,7 +14,7 @@ use super::PassthroughFs;
 #[cfg(feature = "iouring")]
 use crate::async_wrappers::IoUringRuntimeWithEventFd;
 #[cfg(feature = "iouring")]
-use crate::filesystem::filesystem_async::AsyncZeroCopyWriter;
+use crate::filesystem::filesystem_async::{AsyncZeroCopyReader, AsyncZeroCopyWriter};
 use crate::filesystem::{
     Context, Entry, Extensions, FileSystem, FsOptions, GetxattrReply, ListxattrReply, OpenOptions,
     SerializableFileSystem, SetattrValid, SetxattrFlags, ZeroCopyReader, ZeroCopyWriter,
@@ -414,6 +414,22 @@ impl FileSystem for PassthroughFsRo {
         _newname: &CStr,
         _flags: u32,
     ) -> io::Result<()> {
+        Err(erofs())
+    }
+    #[cfg(feature = "iouring")]
+    async fn write_async<R: AsyncZeroCopyReader + Send>(
+        &self,
+        _ctx: Context,
+        _inode: Self::Inode,
+        _handle: Self::Handle,
+        _r: R,
+        _size: u32,
+        _offset: u64,
+        _lock_owner: Option<u64>,
+        _delayed_write: bool,
+        _kill_priv: bool,
+        _flags: u32,
+    ) -> io::Result<usize> {
         Err(erofs())
     }
 
