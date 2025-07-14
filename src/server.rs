@@ -702,7 +702,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn write(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    #[cfg_attr(not(feature = "iouring"), allow(unreachable_code))]
+    #[cfg_attr(not(feature = "iouring"), allow(unused_variables))]
+    #[async_generic]
+    fn write(&self, in_header: InHeader, mut r: Reader<'_>, w: Writer<'_>) -> Result<usize> {
         let WriteIn {
             fh,
             offset,
@@ -724,18 +727,46 @@ impl<F: FileSystem + Sync> Server<F> {
 
         let data_reader = ZcReader(r);
 
-        match self.fs.write(
-            Context::from(in_header),
-            in_header.nodeid.into(),
-            fh.into(),
-            data_reader,
-            size,
-            offset,
-            owner,
-            delayed_write,
-            kill_priv,
-            flags,
-        ) {
+        let res: io::Result<usize>;
+        if _sync {
+            res = self.fs.write(
+                Context::from(in_header),
+                in_header.nodeid.into(),
+                fh.into(),
+                data_reader,
+                size,
+                offset,
+                owner,
+                delayed_write,
+                kill_priv,
+                flags,
+            );
+        } else {
+            #[cfg(feature = "iouring")]
+            {
+                res = self
+                    .fs
+                    .write_async(
+                        Context::from(in_header),
+                        in_header.nodeid.into(),
+                        fh.into(),
+                        data_reader,
+                        size,
+                        offset,
+                        owner,
+                        delayed_write,
+                        kill_priv,
+                        flags,
+                    )
+                    .await;
+            }
+            #[cfg(not(feature = "iouring"))]
+            {
+                unreachable!("async write requires the iouring feature")
+            }
+        }
+
+        match res {
             Ok(count) => {
                 let out = WriteOut {
                     size: count as u32,

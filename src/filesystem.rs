@@ -13,7 +13,7 @@ use std::time::Duration;
 use std::{io, mem};
 
 #[cfg(feature = "iouring")]
-use crate::filesystem::filesystem_async::AsyncZeroCopyWriter;
+use crate::filesystem::filesystem_async::{AsyncZeroCopyReader, AsyncZeroCopyWriter};
 use crate::soft_idmap::{GuestGid, GuestUid};
 use crate::{fuse, oslib};
 
@@ -667,6 +667,36 @@ pub trait FileSystem {
         flags: u32,
     ) -> io::Result<usize> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+
+    /// Asynchronous variant of [`FileSystem::write`].
+    #[cfg(feature = "iouring")]
+    #[allow(clippy::too_many_arguments)]
+    async fn write_async<R: AsyncZeroCopyReader + Send>(
+        &self,
+        ctx: Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        r: R,
+        size: u32,
+        offset: u64,
+        lock_owner: Option<u64>,
+        delayed_write: bool,
+        kill_priv: bool,
+        flags: u32,
+    ) -> io::Result<usize> {
+        self.write(
+            ctx,
+            inode,
+            handle,
+            r,
+            size,
+            offset,
+            lock_owner,
+            delayed_write,
+            kill_priv,
+            flags,
+        )
     }
 
     /// Flush the contents of a file.

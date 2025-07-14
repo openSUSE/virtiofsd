@@ -11,11 +11,45 @@ use vhost::vhost_user::Backend;
 
 use crate::async_wrappers::IoUringState;
 use crate::descriptor_utils::{Reader, Writer};
-use crate::filesystem::filesystem_async::AsyncZeroCopyWriter;
+use crate::filesystem::filesystem_async::{AsyncZeroCopyReader, AsyncZeroCopyWriter};
 use crate::filesystem::{self, FileSystem};
 use crate::fuse::{InHeader, Opcode};
-use crate::server::{reply_error, Server, ZcWriter, FUSE_BUFFER_HEADER_SIZE, MAX_BUFFER_SIZE};
+use crate::server::{
+    reply_error, Server, ZcReader, ZcWriter, FUSE_BUFFER_HEADER_SIZE, MAX_BUFFER_SIZE,
+};
 use crate::{oslib, Error, Result};
+
+#[async_trait]
+impl AsyncZeroCopyReader for ZcReader<'_> {
+    async fn write_to_file_at(
+        &mut self,
+        ring: &Mutex<IoUringState>,
+        f: &File,
+        mut count: usize,
+        mut off: u64,
+        flags: Option<oslib::WritevFlags>,
+    ) -> io::Result<usize> {
+        let start = off;
+        while count > 0 {
+            let written = self
+                .0
+                .write_to_file_at_async(ring, f, count, off, flags)
+                .await?;
+            if written == 0 {
+                break;
+            }
+            off = off
+                .checked_add(written as u64)
+                .ok_or_else(|| io::Error::other("Write wrap-around"))?;
+            count = count
+                .checked_sub(written)
+                .ok_or_else(|| io::Error::other("Write operation wrote more than requested"))?;
+        }
+
+        // Must fit: Cannot be greater than `count` originally
+        Ok((off - start) as usize)
+    }
+}
 
 #[async_trait]
 impl AsyncZeroCopyWriter for ZcWriter<'_> {
@@ -91,7 +125,7 @@ where
                 Opcode::Link => self.link(in_header, r, w),
                 Opcode::Open => self.open(in_header, r, w),
                 Opcode::Read => self.read_async(in_header, r, w).await,
-                Opcode::Write => self.write(in_header, r, w),
+                Opcode::Write => self.write_async(in_header, r, w).await,
                 Opcode::Statfs => self.statfs(in_header, w),
                 Opcode::Release => self.release(in_header, r, w),
                 Opcode::Fsync => self.fsync(in_header, r, w),

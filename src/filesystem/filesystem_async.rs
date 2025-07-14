@@ -8,8 +8,33 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use crate::async_wrappers::IoUringState;
-use crate::filesystem::ZeroCopyWriter;
+use crate::filesystem::{ZeroCopyReader, ZeroCopyWriter};
 use crate::oslib;
+
+/// A trait for directly copying data from the fuse transport into a `File` without first storing it
+/// in an intermediate buffer.
+#[async_trait]
+pub trait AsyncZeroCopyReader: ZeroCopyReader {
+    /// Copies at most `count` bytes from `self` directly into `f` at offset `off` without storing
+    /// it in any intermediate buffers. If the return value is `Ok(n)` then it must be guaranteed
+    /// that `0 <= n <= count`. If `n` is `0`, then it can indicate one of 3 possibilities:
+    ///
+    /// 1. There is no more data left in `self`.
+    /// 2. There is no more space in `f`.
+    /// 3. `count` was `0`.
+    ///
+    /// Does not do short writes, unless one of the above happens; i.e. will invoke the underlying
+    /// file write function until `count` bytes have been written or it returns 0 (case 2 above) or
+    /// `self` is empty (case 1 above).
+    async fn write_to_file_at(
+        &mut self,
+        ring: &Mutex<IoUringState>,
+        f: &File,
+        count: usize,
+        off: u64,
+        flags: Option<oslib::WritevFlags>,
+    ) -> io::Result<usize>;
+}
 
 /// A trait for directly copying data from a `File` into the fuse transport without first storing
 /// it in an intermediate buffer.
