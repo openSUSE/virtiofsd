@@ -386,6 +386,18 @@ impl FileSystem for PassthroughFsRo {
             _flags: u64,
         ) -> io::Result<usize>;
     }
+    #[cfg(feature = "iouring")]
+    async fn rename_async(
+        &self,
+        _ctx: Context,
+        _olddir: Self::Inode,
+        _oldname: &CStr,
+        _newdir: Self::Inode,
+        _newname: &CStr,
+        _flags: u32,
+    ) -> io::Result<()> {
+        Err(erofs())
+    }
 
     fn open(
         &self,

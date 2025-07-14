@@ -466,6 +466,19 @@ pub trait FileSystem {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
+    #[cfg(feature = "iouring")]
+    async fn rename_async(
+        &self,
+        ctx: Context,
+        olddir: Self::Inode,
+        oldname: &CStr,
+        newdir: Self::Inode,
+        newname: &CStr,
+        flags: u32,
+    ) -> io::Result<()> {
+        self.rename(ctx, olddir, oldname, newdir, newname, flags)
+    }
+
     /// Create a hard link.
     ///
     /// Create a hard link from `inode` to `newname` in the directory represented by `newparent`.
