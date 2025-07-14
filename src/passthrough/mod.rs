@@ -18,6 +18,8 @@ pub mod xattrmap;
 
 #[cfg(feature = "iouring")]
 use crate::async_wrappers::{IoUringRuntime, IoUringRuntimeWithEventFd, IoUringState};
+#[cfg(feature = "iouring")]
+use crate::filesystem::filesystem_async::AsyncZeroCopyWriter;
 use crate::filesystem::{
     Context, Entry, Extensions, FileSystem, FsOptions, GetxattrReply, ListxattrReply, OpenOptions,
     SecContext, SetattrValid, SetxattrFlags, ZeroCopyReader, ZeroCopyWriter,
@@ -1971,6 +1973,22 @@ impl FileSystem for PassthroughFs {
         // offset is not affected by this operation.
         let f = data.file.get()?.read_blocking();
         w.read_from_file_at(f.get_file(), size as usize, offset, None)
+    }
+
+    #[cfg(feature = "iouring")]
+    async fn read_async<R: AsyncZeroCopyWriter + Send>(
+        &self,
+        ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        r: R,
+        size: u32,
+        offset: u64,
+        lock_owner: Option<u64>,
+        flags: u32,
+    ) -> io::Result<usize> {
+        self.do_read_async(ctx, inode, handle, r, size, offset, lock_owner, flags)
+            .await
     }
 
     fn write<R: ZeroCopyReader>(

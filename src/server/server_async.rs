@@ -2,15 +2,52 @@
 //
 // SPDX-License-Identifier: (Apache-2.0 AND BSD-3-Clause)
 use std::convert::TryFrom as _;
+use std::fs::File;
 use std::io;
+use std::sync::Mutex;
 
+use async_trait::async_trait;
 use vhost::vhost_user::Backend;
 
+use crate::async_wrappers::IoUringState;
 use crate::descriptor_utils::{Reader, Writer};
+use crate::filesystem::filesystem_async::AsyncZeroCopyWriter;
 use crate::filesystem::{self, FileSystem};
 use crate::fuse::{InHeader, Opcode};
-use crate::server::{reply_error, Server, FUSE_BUFFER_HEADER_SIZE, MAX_BUFFER_SIZE};
-use crate::{Error, Result};
+use crate::server::{reply_error, Server, ZcWriter, FUSE_BUFFER_HEADER_SIZE, MAX_BUFFER_SIZE};
+use crate::{oslib, Error, Result};
+
+#[async_trait]
+impl AsyncZeroCopyWriter for ZcWriter<'_> {
+    async fn read_from_file_at(
+        &mut self,
+        ring: &Mutex<IoUringState>,
+        f: &File,
+        mut count: usize,
+        mut off: u64,
+        flags: Option<oslib::ReadvFlags>,
+    ) -> io::Result<usize> {
+        let start = off;
+        while count > 0 {
+            let read = self
+                .0
+                .read_from_file_at_async(ring, f, count, off, flags)
+                .await?;
+            if read == 0 {
+                break;
+            }
+            off = off
+                .checked_add(read as u64)
+                .ok_or_else(|| io::Error::other("Read wrap-around"))?;
+            count = count
+                .checked_sub(read)
+                .ok_or_else(|| io::Error::other("Read operation wrote more than requested"))?;
+        }
+
+        // Must fit: Cannot be greater than `count` originally
+        Ok((off - start) as usize)
+    }
+}
 
 impl<F: FileSystem + Sync> Server<F>
 where
@@ -53,7 +90,7 @@ where
                 Opcode::Rename => self.rename_async(in_header, r, w).await,
                 Opcode::Link => self.link(in_header, r, w),
                 Opcode::Open => self.open(in_header, r, w),
-                Opcode::Read => self.read(in_header, r, w),
+                Opcode::Read => self.read_async(in_header, r, w).await,
                 Opcode::Write => self.write(in_header, r, w),
                 Opcode::Statfs => self.statfs(in_header, w),
                 Opcode::Release => self.release(in_header, r, w),
