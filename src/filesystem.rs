@@ -2,6 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#[cfg(feature = "iouring")]
+pub mod filesystem_async;
+
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::sync::atomic::AtomicBool;
@@ -9,6 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{io, mem};
 
+#[cfg(feature = "iouring")]
+use crate::filesystem::filesystem_async::AsyncZeroCopyWriter;
 use crate::soft_idmap::{GuestGid, GuestUid};
 use crate::{fuse, oslib};
 
@@ -609,6 +614,23 @@ pub trait FileSystem {
         flags: u32,
     ) -> io::Result<usize> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+
+    /// Asynchronous variant of [`FileSystem::read`].
+    #[cfg(feature = "iouring")]
+    #[allow(clippy::too_many_arguments)]
+    async fn read_async<W: AsyncZeroCopyWriter + Send>(
+        &self,
+        ctx: Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        w: W,
+        size: u32,
+        offset: u64,
+        lock_owner: Option<u64>,
+        flags: u32,
+    ) -> io::Result<usize> {
+        self.read(ctx, inode, handle, w, size, offset, lock_owner, flags)
     }
 
     /// Write data to a file.

@@ -2,6 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#[cfg(feature = "iouring")]
+pub mod descriptor_utils_async;
+
 use std::collections::VecDeque;
 use std::fmt::{self, Display};
 use std::io::{self, Read, Write};
@@ -75,19 +78,9 @@ impl<'a, B: BitmapSlice> DescriptorChainConsumer<'a, B> {
         self.bytes_consumed
     }
 
-    /// Consumes at most `count` bytes from the `DescriptorChain`. Callers must provide a function
-    /// that takes a `&[VolatileSlice]` and returns the total number of bytes consumed. This
-    /// function guarantees that the combined length of all the slices in the `&[VolatileSlice]` is
-    /// less than or equal to `count`.
-    ///
-    /// # Errors
-    ///
-    /// If the provided function returns any error then no bytes are consumed from the buffer and
-    /// the error is returned to the caller.
-    fn consume<F>(&mut self, count: usize, f: F) -> io::Result<usize>
-    where
-        F: FnOnce(&[&VolatileSlice<B>]) -> io::Result<usize>,
-    {
+    /// Returns at most `count` bytes from the `DescriptorChain`. The combined length of all the
+    /// slices in the `Vec<&VolatileSlice<B>>` is less than or equal to `count`.
+    fn head(&self, count: usize) -> Vec<&VolatileSlice<'_, B>> {
         let mut buflen = 0;
         let mut bufs = Vec::with_capacity(self.buffers.len());
         for vs in &self.buffers {
@@ -104,23 +97,19 @@ impl<'a, B: BitmapSlice> DescriptorChainConsumer<'a, B> {
                 buflen += vs.len();
             }
         }
+        bufs
+    }
 
-        if bufs.is_empty() {
-            return Ok(0);
-        }
+    /// Discards `count` bytes from the front of the `DescriptorChain`.
+    fn discard_front(&mut self, count: usize) -> io::Result<()> {
+        // As long as the user of `DescriptorChainConsumer` consumes/discards less or equal to
+        // available bytes in total, this can happen if a driver tricks a device into
+        // reading/writing more data than fits in a `usize`.
+        let total_bytes_consumed = self.bytes_consumed.checked_add(count).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, Error::DescriptorChainOverflow)
+        })?;
 
-        let bytes_consumed = f(&bufs)?;
-
-        // This can happen if a driver tricks a device into reading/writing more data than
-        // fits in a `usize`.
-        let total_bytes_consumed =
-            self.bytes_consumed
-                .checked_add(bytes_consumed)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, Error::DescriptorChainOverflow)
-                })?;
-
-        let mut rem = bytes_consumed;
+        let mut rem = count;
         while let Some(vs) = self.buffers.pop_front() {
             if rem < vs.len() {
                 // Split the slice and push the remainder back into the buffer list. Safe because we
@@ -135,6 +124,31 @@ impl<'a, B: BitmapSlice> DescriptorChainConsumer<'a, B> {
         }
 
         self.bytes_consumed = total_bytes_consumed;
+
+        Ok(())
+    }
+
+    /// Consumes at most `count` bytes from the `DescriptorChain`. Callers must provide a function
+    /// that takes a `&[VolatileSlice]` and returns the total number of bytes consumed. This
+    /// function guarantees that the combined length of all the slices in the `&[VolatileSlice]` is
+    /// less than or equal to `count`.
+    ///
+    /// # Errors
+    ///
+    /// If the provided function returns any error then no bytes are consumed from the buffer and
+    /// the error is returned to the caller.
+    fn consume<F>(&mut self, count: usize, f: F) -> io::Result<usize>
+    where
+        F: FnOnce(&[&VolatileSlice<B>]) -> io::Result<usize>,
+    {
+        let bufs = self.head(count);
+        if bufs.is_empty() {
+            return Ok(0);
+        }
+
+        let bytes_consumed = f(&bufs)?;
+
+        self.discard_front(bytes_consumed)?;
 
         Ok(bytes_consumed)
     }

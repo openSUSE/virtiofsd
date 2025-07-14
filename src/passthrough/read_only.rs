@@ -13,6 +13,8 @@ use super::util::{einval, erofs};
 use super::PassthroughFs;
 #[cfg(feature = "iouring")]
 use crate::async_wrappers::IoUringRuntimeWithEventFd;
+#[cfg(feature = "iouring")]
+use crate::filesystem::filesystem_async::AsyncZeroCopyWriter;
 use crate::filesystem::{
     Context, Entry, Extensions, FileSystem, FsOptions, GetxattrReply, ListxattrReply, OpenOptions,
     SerializableFileSystem, SetattrValid, SetxattrFlags, ZeroCopyReader, ZeroCopyWriter,
@@ -276,6 +278,22 @@ impl FileSystem for PassthroughFsRo {
             whence: u32,
         ) -> io::Result<u64>;
         fn syncfs(&self, ctx: Context, inode: Self::Inode) -> io::Result<()>;
+    }
+    #[cfg(feature = "iouring")]
+    async fn read_async<W: AsyncZeroCopyWriter + Send>(
+        &self,
+        ctx: Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        w: W,
+        size: u32,
+        offset: u64,
+        lock_owner: Option<u64>,
+        flags: u32,
+    ) -> io::Result<usize> {
+        self.0
+            .read_async(ctx, inode, handle, w, size, offset, lock_owner, flags)
+            .await
     }
 
     // Refuse to run these functions, always returning EROFS.

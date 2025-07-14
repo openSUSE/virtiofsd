@@ -626,7 +626,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn read(&self, in_header: InHeader, mut r: Reader, mut w: Writer) -> Result<usize> {
+    #[cfg_attr(not(feature = "iouring"), allow(unreachable_code))]
+    #[cfg_attr(not(feature = "iouring"), allow(unused_variables))]
+    #[async_generic]
+    fn read(&self, in_header: InHeader, mut r: Reader<'_>, mut w: Writer<'_>) -> Result<usize> {
         let ReadIn {
             fh,
             offset,
@@ -646,16 +649,42 @@ impl<F: FileSystem + Sync> Server<F> {
         // Split the writer into 2 pieces: one for the `OutHeader` and the rest for the data.
         let data_writer = ZcWriter(w.split_at(size_of::<OutHeader>()).unwrap());
 
-        match self.fs.read(
-            Context::from(in_header),
-            in_header.nodeid.into(),
-            fh.into(),
-            data_writer,
-            size,
-            offset,
-            owner,
-            flags,
-        ) {
+        let res: io::Result<usize>;
+        if _sync {
+            res = self.fs.read(
+                Context::from(in_header),
+                in_header.nodeid.into(),
+                fh.into(),
+                data_writer,
+                size,
+                offset,
+                owner,
+                flags,
+            );
+        } else {
+            #[cfg(feature = "iouring")]
+            {
+                res = self
+                    .fs
+                    .read_async(
+                        Context::from(in_header),
+                        in_header.nodeid.into(),
+                        fh.into(),
+                        data_writer,
+                        size,
+                        offset,
+                        owner,
+                        flags,
+                    )
+                    .await
+            }
+            #[cfg(not(feature = "iouring"))]
+            {
+                unreachable!("async read requires the iouring feature")
+            }
+        }
+
+        match res {
             Ok(count) => {
                 // Don't use `reply_ok` because we need to set a custom size length for the
                 // header.
