@@ -14,6 +14,7 @@ use crate::fuse::*;
 use crate::passthrough::util::einval;
 use crate::soft_idmap::GuestGid;
 use crate::{oslib, Error, Result};
+use async_generic::async_generic;
 use std::convert::{TryFrom, TryInto};
 use std::ffi::{CStr, CString};
 use std::fs::File;
@@ -462,14 +463,17 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
+    #[cfg_attr(not(feature = "iouring"), allow(unreachable_code))]
+    #[cfg_attr(not(feature = "iouring"), allow(unused_variables))]
+    #[async_generic]
     fn do_rename(
         &self,
         in_header: InHeader,
         msg_size: usize,
         newdir: u64,
         flags: u32,
-        mut r: Reader,
-        w: Writer,
+        mut r: Reader<'_>,
+        w: Writer<'_>,
     ) -> Result<usize> {
         let buflen = (in_header.len as usize)
             .checked_sub(size_of::<InHeader>())
@@ -488,32 +492,86 @@ impl<F: FileSystem + Sync> Server<F> {
 
         let (oldname, newname) = buf.split_at(split_pos);
 
-        match self.fs.rename(
-            Context::from(in_header),
-            in_header.nodeid.into(),
-            bytes_to_cstr(oldname)?,
-            newdir.into(),
-            bytes_to_cstr(newname)?,
-            flags,
-        ) {
+        let res;
+        if _sync {
+            res = self.fs.rename(
+                Context::from(in_header),
+                in_header.nodeid.into(),
+                bytes_to_cstr(oldname)?,
+                newdir.into(),
+                bytes_to_cstr(newname)?,
+                flags,
+            );
+        } else {
+            #[cfg(feature = "iouring")]
+            {
+                res = self
+                    .fs
+                    .rename_async(
+                        Context::from(in_header),
+                        in_header.nodeid.into(),
+                        bytes_to_cstr(oldname)?,
+                        newdir.into(),
+                        bytes_to_cstr(newname)?,
+                        flags,
+                    )
+                    .await;
+            }
+            #[cfg(not(feature = "iouring"))]
+            {
+                unreachable!("async rename requires the iouring feature")
+            }
+        }
+
+        match res {
             Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
             Err(e) => reply_error(e, in_header.unique, w),
         }
     }
 
-    fn rename(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    #[cfg_attr(not(feature = "iouring"), allow(unreachable_code))]
+    #[cfg_attr(not(feature = "iouring"), allow(unused_variables))]
+    #[async_generic]
+    fn rename(&self, in_header: InHeader, mut r: Reader<'_>, w: Writer<'_>) -> Result<usize> {
         let RenameIn { newdir } = r.read_obj().map_err(Error::DecodeMessage)?;
 
-        self.do_rename(in_header, size_of::<RenameIn>(), newdir, 0, r, w)
+        if _sync {
+            self.do_rename(in_header, size_of::<RenameIn>(), newdir, 0, r, w)
+        } else {
+            #[cfg(feature = "iouring")]
+            {
+                self.do_rename_async(in_header, size_of::<RenameIn>(), newdir, 0, r, w)
+                    .await
+            }
+            #[cfg(not(feature = "iouring"))]
+            {
+                unreachable!("async rename requires the iouring feature")
+            }
+        }
     }
 
-    fn rename2(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    #[cfg_attr(not(feature = "iouring"), allow(unreachable_code))]
+    #[cfg_attr(not(feature = "iouring"), allow(unused_variables))]
+    #[async_generic]
+    fn rename2(&self, in_header: InHeader, mut r: Reader<'_>, w: Writer<'_>) -> Result<usize> {
         let Rename2In { newdir, flags, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         let flags =
             flags & (libc::RENAME_EXCHANGE | libc::RENAME_NOREPLACE | libc::RENAME_WHITEOUT);
 
-        self.do_rename(in_header, size_of::<Rename2In>(), newdir, flags, r, w)
+        if _sync {
+            self.do_rename(in_header, size_of::<RenameIn>(), newdir, flags, r, w)
+        } else {
+            #[cfg(feature = "iouring")]
+            {
+                self.do_rename_async(in_header, size_of::<RenameIn>(), newdir, flags, r, w)
+                    .await
+            }
+            #[cfg(not(feature = "iouring"))]
+            {
+                unreachable!("async rename requires the iouring feature")
+            }
+        }
     }
 
     fn link(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {

@@ -17,11 +17,13 @@ pub mod util;
 pub mod xattrmap;
 
 #[cfg(feature = "iouring")]
-use crate::async_wrappers::{IoUringRuntime, IoUringRuntimeWithEventFd};
+use crate::async_wrappers::{IoUringRuntime, IoUringRuntimeWithEventFd, IoUringState};
 use crate::filesystem::{
     Context, Entry, Extensions, FileSystem, FsOptions, GetxattrReply, ListxattrReply, OpenOptions,
     SecContext, SetattrValid, SetxattrFlags, ZeroCopyReader, ZeroCopyWriter,
 };
+#[cfg(feature = "iouring")]
+use crate::passthrough::asyncs::io_uring::IoUringAwait;
 use crate::passthrough::credentials::{drop_effective_cap, UnixCredentials, UnixCredentialsGuard};
 use crate::passthrough::device_state::preserialization::{
     self, HandleMigrationInfo, InodeMigrationInfo,
@@ -37,8 +39,13 @@ use crate::read_dir::ReadDir;
 use crate::soft_idmap::{self, GuestGid, GuestUid, HostGid, HostUid, Id, IdMap};
 use crate::util::{other_io_error, ResultErrorContext};
 use crate::{fuse, oslib};
+use async_generic::async_generic;
 use file_handle::{FileHandle, FileOrHandle, OpenableFileHandle};
 use guest_fd_limit::{GuestFdSemaphore, GuestFile};
+#[cfg(feature = "iouring")]
+use io_uring::opcode;
+#[cfg(feature = "iouring")]
+use io_uring::types::Fd;
 use mount_fd::{MPRError, MountFds};
 pub(crate) use stat::{statx, StatExt};
 use std::borrow::Cow;
@@ -660,6 +667,11 @@ impl PassthroughFs {
             .ok_or_else(ebadf)
     }
 
+    #[cfg(feature = "iouring")]
+    fn io_uring(&self) -> Option<&Arc<Mutex<IoUringState>>> {
+        self.io_uring_runtime.as_ref().map(|runtime| &runtime.state)
+    }
+
     fn open_inode(&self, inode: Inode, mut flags: i32) -> io::Result<File> {
         let data = self.inodes.get(inode).ok_or_else(ebadf)?;
 
@@ -1252,6 +1264,88 @@ impl PassthroughFs {
             }
         }
         Ok(fd)
+    }
+
+    #[cfg_attr(not(feature = "iouring"), allow(unreachable_code))]
+    #[cfg_attr(not(feature = "iouring"), allow(unused_variables))]
+    #[async_generic]
+    fn do_rename(
+        &self,
+        _ctx: Context,
+        olddir: Inode,
+        oldname: &CStr,
+        newdir: Inode,
+        newname: &CStr,
+        flags: u32,
+    ) -> io::Result<()> {
+        let old_inode = self.inodes.get(olddir).ok_or_else(ebadf)?;
+        let new_inode = self.inodes.get(newdir).ok_or_else(ebadf)?;
+
+        let old_file = old_inode.get_file()?;
+        let new_file = new_inode.get_file()?;
+
+        let invalidated_inode = self.before_invalidating_path(&new_inode, newname);
+
+        let err: Option<io::Error>;
+        if _sync {
+            // Safe because this doesn't modify any memory and we check the return value.
+            // TODO: Switch to libc::renameat2 once https://github.com/rust-lang/libc/pull/1508 lands
+            // and we have glibc 2.28.
+            let res = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    old_file.as_raw_fd(),
+                    oldname.as_ptr(),
+                    new_file.as_raw_fd(),
+                    newname.as_ptr(),
+                    flags,
+                )
+            };
+            if res != 0 {
+                err = Some(io::Error::last_os_error());
+            } else {
+                err = None;
+            }
+        } else {
+            #[cfg(feature = "iouring")]
+            {
+                let e = opcode::RenameAt::new(
+                    Fd(old_file.as_raw_fd()),
+                    oldname.as_ptr(),
+                    Fd(new_file.as_raw_fd()),
+                    newname.as_ptr(),
+                )
+                .flags(flags)
+                .build();
+
+                // Safety: Safe because e is properly initialized and the created future is awaited.
+                let res = unsafe { IoUringAwait::op(self.io_uring().unwrap(), e) }.await;
+                if res != 0 {
+                    err = Some(io::Error::from_raw_os_error(-res));
+                } else {
+                    err = None;
+                }
+            }
+            #[cfg(not(feature = "iouring"))]
+            {
+                unreachable!("async rename requires the iouring feature");
+            }
+        }
+        if let Some(invalidated_inode) = invalidated_inode {
+            self.after_invalidating_path(invalidated_inode, "Overwrote (via rename)");
+        }
+        if let Some(e) = err {
+            return Err(e);
+        }
+
+        if let Err(err) = self.update_inode_migration_info(new_inode, newname) {
+            warn!(
+                "Failed to update renamed file's ({oldname:?} -> {newname:?}) migration info, \
+                the migration destination may be unable to find it: {err}",
+            );
+        }
+
+        Ok(())
     }
 
     fn do_mknod_mkdir_symlink_secctx(
@@ -2074,48 +2168,28 @@ impl FileSystem for PassthroughFs {
 
     fn rename(
         &self,
-        _ctx: Context,
+        ctx: Context,
         olddir: Inode,
         oldname: &CStr,
         newdir: Inode,
         newname: &CStr,
         flags: u32,
     ) -> io::Result<()> {
-        let old_inode = self.inodes.get(olddir).ok_or_else(ebadf)?;
-        let new_inode = self.inodes.get(newdir).ok_or_else(ebadf)?;
+        self.do_rename(ctx, olddir, oldname, newdir, newname, flags)
+    }
 
-        let old_file = old_inode.get_file()?;
-        let new_file = new_inode.get_file()?;
-
-        let invalidated_inode = self.before_invalidating_path(&new_inode, newname);
-        // Safe because this doesn't modify any memory and we check the return value.
-        // TODO: Switch to libc::renameat2 once https://github.com/rust-lang/libc/pull/1508 lands
-        // and we have glibc 2.28.
-        let res = unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                old_file.as_raw_fd(),
-                oldname.as_ptr(),
-                new_file.as_raw_fd(),
-                newname.as_ptr(),
-                flags,
-            )
-        };
-        if let Some(invalidated_inode) = invalidated_inode {
-            self.after_invalidating_path(invalidated_inode, "Overwrote (via rename)");
-        }
-        if res != 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        if let Err(err) = self.update_inode_migration_info(new_inode, newname) {
-            warn!(
-                "Failed to update renamed file's ({oldname:?} -> {newname:?}) migration info, \
-                the migration destination may be unable to find it: {err}",
-            );
-        }
-
-        Ok(())
+    #[cfg(feature = "iouring")]
+    async fn rename_async(
+        &self,
+        ctx: Context,
+        olddir: Self::Inode,
+        oldname: &CStr,
+        newdir: Self::Inode,
+        newname: &CStr,
+        flags: u32,
+    ) -> io::Result<()> {
+        self.do_rename_async(ctx, olddir, oldname, newdir, newname, flags)
+            .await
     }
 
     fn mknod(

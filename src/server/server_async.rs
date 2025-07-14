@@ -7,10 +7,10 @@ use std::io;
 use vhost::vhost_user::Backend;
 
 use crate::descriptor_utils::{Reader, Writer};
-use crate::filesystem::FileSystem;
+use crate::filesystem::{self, FileSystem};
 use crate::fuse::{InHeader, Opcode};
 use crate::server::{reply_error, Server, FUSE_BUFFER_HEADER_SIZE, MAX_BUFFER_SIZE};
-use crate::{filesystem, Error, Result};
+use crate::{Error, Result};
 
 impl<F: FileSystem + Sync> Server<F>
 where
@@ -50,7 +50,7 @@ where
                 Opcode::Mkdir => self.mkdir(in_header, r, w),
                 Opcode::Unlink => self.unlink(in_header, r, w),
                 Opcode::Rmdir => self.rmdir(in_header, r, w),
-                Opcode::Rename => self.rename(in_header, r, w),
+                Opcode::Rename => self.rename_async(in_header, r, w).await,
                 Opcode::Link => self.link(in_header, r, w),
                 Opcode::Open => self.open(in_header, r, w),
                 Opcode::Read => self.read(in_header, r, w),
@@ -82,7 +82,7 @@ where
                 Opcode::BatchForget => self.batch_forget(in_header, r, w),
                 Opcode::Fallocate => self.fallocate(in_header, r, w),
                 Opcode::Readdirplus => self.readdirplus(in_header, r, w),
-                Opcode::Rename2 => self.rename2(in_header, r, w),
+                Opcode::Rename2 => self.rename2_async(in_header, r, w).await,
                 Opcode::Lseek => self.lseek(in_header, r, w),
                 Opcode::CopyFileRange => self.copyfilerange(in_header, r, w),
                 Opcode::SetupMapping => self.setupmapping(in_header, r, w, vu_req.as_mut()),
