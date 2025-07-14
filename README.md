@@ -163,6 +163,11 @@ Prevent write accesses from the guest.  Note that this does not make the
 underlying shared directory an actual read-only mount, so e.g. the access time
 is still updated on accesses.
 
+```shell
+--io-uring
+```
+Use io_uring for underlying host-side I/O operations.
+
 #### Options
 ```shell
 --shared-dir <shared-dir>

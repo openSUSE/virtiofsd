@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#[cfg(feature = "iouring")]
+pub mod asyncs;
 pub mod credentials;
 pub mod device_state;
 pub mod file_handle;
@@ -9,10 +11,13 @@ mod guest_fd_limit;
 pub mod inode_store;
 pub mod mount_fd;
 pub mod read_only;
+pub mod smol_wrapper;
 pub mod stat;
 pub mod util;
 pub mod xattrmap;
 
+#[cfg(feature = "iouring")]
+use crate::async_wrappers::{IoUringRuntime, IoUringRuntimeWithEventFd};
 use crate::filesystem::{
     Context, Entry, Extensions, FileSystem, FsOptions, GetxattrReply, ListxattrReply, OpenOptions,
     SecContext, SetattrValid, SetxattrFlags, ZeroCopyReader, ZeroCopyWriter,
@@ -24,6 +29,7 @@ use crate::passthrough::device_state::preserialization::{
 use crate::passthrough::inode_store::{
     Inode, InodeData, InodeFile, InodeIds, InodeStore, StrongInodeReference,
 };
+use crate::passthrough::smol_wrapper::SmolRwLock;
 use crate::passthrough::util::{
     ebadf, is_safe_inode, openat, openat_verbose, reopen_fd_through_proc,
 };
@@ -55,7 +61,7 @@ const EMPTY_CSTR: &[u8] = b"\0";
 type Handle = u64;
 
 enum HandleDataFile {
-    File(RwLock<GuestFile>),
+    File(SmolRwLock<GuestFile>),
     // `io::Error` does not implement `Clone`, so without wrapping it in `Arc`, returning the error
     // anywhere would be impossible without consuming it
     Invalid(Arc<io::Error>),
@@ -390,6 +396,10 @@ pub struct Config {
     ///
     /// The default is `u64::MAX`.
     pub guest_fd_limit: u64,
+
+    /// Whether to use asynchronous I/O via io_uring.
+    #[cfg(feature = "iouring")]
+    pub use_io_uring: bool,
 }
 
 impl Default for Config {
@@ -422,6 +432,8 @@ impl Default for Config {
             uid_map: None,
             gid_map: None,
             guest_fd_limit: u64::MAX,
+            #[cfg(feature = "iouring")]
+            use_io_uring: false,
         }
     }
 }
@@ -491,10 +503,17 @@ pub struct PassthroughFs {
 
     /// Map to translate between host and guest GIDs.
     gid_map: IdMap<GuestGid, HostGid>,
+
+    /// io_uring runtime
+    #[cfg(feature = "iouring")]
+    io_uring_runtime: Option<IoUringRuntime>,
 }
 
 impl PassthroughFs {
-    pub fn new(mut cfg: Config) -> io::Result<PassthroughFs> {
+    pub fn new(
+        mut cfg: Config,
+        #[cfg(feature = "iouring")] io_uring_runtime: Option<&IoUringRuntimeWithEventFd>,
+    ) -> io::Result<PassthroughFs> {
         let proc_self_fd = if let Some(fd) = cfg.proc_sfd_rawfd.take() {
             fd
         } else {
@@ -540,6 +559,12 @@ impl PassthroughFs {
             IdMap::empty()
         };
 
+        #[cfg(feature = "iouring")]
+        let (io_uring_runtime, io_uring_eventfd) = if let Some(r) = io_uring_runtime {
+            (Some(r.runtime().clone()), Some(r.event_fd()))
+        } else {
+            (None, None)
+        };
         let mut fs = PassthroughFs {
             inodes: Default::default(),
             next_inode: AtomicU64::new(fuse::ROOT_ID + 1),
@@ -558,6 +583,8 @@ impl PassthroughFs {
             cfg,
             uid_map,
             gid_map,
+            #[cfg(feature = "iouring")]
+            io_uring_runtime,
         };
 
         // Check to see if the client remapped "security.capability", if so,
@@ -576,11 +603,31 @@ impl PassthroughFs {
         // able to set all the bits in the mode.
         oslib::umask(0o000);
 
+        #[cfg(feature = "iouring")]
+        if let Some(eventfd) = io_uring_eventfd {
+            // Register the eventfd with io_uring if we are using it.
+            fs.register_io_uring_fd(eventfd.as_raw_fd())
+                .err_context(|| "Failed to register eventfd with io_uring")?;
+        }
+
         Ok(fs)
     }
 
     fn switch_to_proc_self_fd(&self) -> ScopedWorkingDirectory {
         ScopedWorkingDirectory::new(self.proc_self_fd.as_raw_fd(), self.orig_wd_fd.as_raw_fd())
+    }
+
+    #[cfg(feature = "iouring")]
+    fn register_io_uring_fd(&self, fd: RawFd) -> io::Result<()> {
+        self.io_uring_runtime
+            .as_ref()
+            .expect("io_uring runtime should be set")
+            .state
+            .lock()
+            .expect("Lock poisoned: another thread must have panicked")
+            .ring
+            .submitter()
+            .register_eventfd(fd)
     }
 
     pub fn keep_fds(&self) -> Vec<RawFd> {
@@ -1498,6 +1545,7 @@ impl PassthroughFs {
     }
 }
 
+#[cfg_attr(feature = "iouring", async_trait::async_trait)]
 impl FileSystem for PassthroughFs {
     type Inode = Inode;
     type Handle = Handle;
@@ -1692,7 +1740,7 @@ impl FileSystem for PassthroughFs {
         // lock for both the `lseek64` and `getdents64` syscalls to ensure that no other
         // thread changes the kernel offset while we are using it.
         #[allow(clippy::readonly_write_lock)]
-        let dir = data.file.get()?.write().unwrap();
+        let dir = data.file.get()?.write_blocking();
 
         ReadDir::new(&*dir, offset as libc::off64_t, buf)
     }
@@ -1815,7 +1863,7 @@ impl FileSystem for PassthroughFs {
 
         // This is safe because read_from_file_at uses preadv64, so the underlying file descriptor
         // offset is not affected by this operation.
-        let f = data.file.get()?.read().unwrap();
+        let f = data.file.get()?.read_blocking();
         w.read_from_file_at(f.get_file(), size as usize, offset, None)
     }
 
@@ -1836,7 +1884,7 @@ impl FileSystem for PassthroughFs {
 
         // This is safe because write_to_file_at uses `pwritev2(2)`, so the underlying file
         // descriptor offset is not affected by this operation.
-        let f = data.file.get()?.read().unwrap();
+        let f = data.file.get()?.read_blocking();
 
         {
             let _killpriv_guard = if self.cfg.killpriv_v2 && kill_priv {
@@ -1900,7 +1948,7 @@ impl FileSystem for PassthroughFs {
         let data = if let Some(handle) = handle {
             let hd = self.find_handle(handle, inode)?;
 
-            let fd = hd.file.get()?.write().unwrap().as_raw_fd();
+            let fd = hd.file.get()?.write_blocking().as_raw_fd();
             Data::Handle(hd, fd)
         } else {
             let pathname = CString::new(format!("{}", inode_file.as_raw_fd()))
@@ -2236,7 +2284,7 @@ impl FileSystem for PassthroughFs {
         // behavior by doing the same thing (dup-ing the fd and then immediately closing it). Safe
         // because this doesn't modify any memory and we check the return values.
         unsafe {
-            let newfd = libc::dup(data.file.get()?.write().unwrap().as_raw_fd());
+            let newfd = libc::dup(data.file.get()?.write_blocking().as_raw_fd());
             if newfd < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -2252,7 +2300,7 @@ impl FileSystem for PassthroughFs {
     fn fsync(&self, _ctx: Context, inode: Inode, datasync: bool, handle: Handle) -> io::Result<()> {
         let data = self.find_handle(handle, inode)?;
 
-        let fd = data.file.get()?.write().unwrap().as_raw_fd();
+        let fd = data.file.get()?.write_blocking().as_raw_fd();
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe {
@@ -2572,7 +2620,7 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<()> {
         let data = self.find_handle(handle, inode)?;
 
-        let fd = data.file.get()?.write().unwrap().as_raw_fd();
+        let fd = data.file.get()?.write_blocking().as_raw_fd();
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe {
             libc::fallocate64(
@@ -2599,7 +2647,7 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<u64> {
         let data = self.find_handle(handle, inode)?;
 
-        let fd = data.file.get()?.write().unwrap().as_raw_fd();
+        let fd = data.file.get()?.write_blocking().as_raw_fd();
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::lseek(fd, offset as libc::off64_t, whence as libc::c_int) };
@@ -2625,12 +2673,12 @@ impl FileSystem for PassthroughFs {
         let data_in = self.find_handle(handle_in, inode_in)?;
 
         // Take just a read lock as we're not going to alter the file descriptor offset.
-        let fd_in = data_in.file.get()?.read().unwrap().as_raw_fd();
+        let fd_in = data_in.file.get()?.read_blocking().as_raw_fd();
 
         let data_out = self.find_handle(handle_out, inode_out)?;
 
         // Take just a read lock as we're not going to alter the file descriptor offset.
-        let fd_out = data_out.file.get()?.read().unwrap().as_raw_fd();
+        let fd_out = data_out.file.get()?.read_blocking().as_raw_fd();
 
         // Safe because this will only modify `offset_in` and `offset_out` and we check
         // the return value.
@@ -2669,7 +2717,7 @@ impl FileSystem for PassthroughFs {
 }
 
 impl HandleDataFile {
-    fn get(&self) -> io::Result<&'_ RwLock<GuestFile>> {
+    fn get(&self) -> io::Result<&'_ SmolRwLock<GuestFile>> {
         match self {
             HandleDataFile::File(file) => Ok(file),
             HandleDataFile::Invalid(err) => Err(io::Error::new(
@@ -2682,6 +2730,6 @@ impl HandleDataFile {
 
 impl From<GuestFile> for HandleDataFile {
     fn from(file: GuestFile) -> Self {
-        HandleDataFile::File(RwLock::new(file))
+        HandleDataFile::File(SmolRwLock::new(file))
     }
 }
