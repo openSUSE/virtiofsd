@@ -1360,7 +1360,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn create(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    #[cfg_attr(not(feature = "iouring"), allow(unreachable_code))]
+    #[cfg_attr(not(feature = "iouring"), allow(unused_variables))]
+    #[async_generic]
+    fn create(&self, in_header: InHeader, mut r: Reader<'_>, w: Writer<'_>) -> Result<usize> {
         let CreateIn {
             flags,
             mode,
@@ -1386,16 +1389,42 @@ impl<F: FileSystem + Sync> Server<F> {
 
         let kill_priv = open_flags & OPEN_KILL_SUIDGID != 0;
 
-        match self.fs.create(
-            Context::from(in_header),
-            in_header.nodeid.into(),
-            bytes_to_cstr(name)?,
-            mode,
-            kill_priv,
-            flags,
-            umask,
-            extensions,
-        ) {
+        let res: io::Result<(Entry, Option<F::Handle>, OpenOptions)>;
+        if _sync {
+            res = self.fs.create(
+                Context::from(in_header),
+                in_header.nodeid.into(),
+                bytes_to_cstr(name)?,
+                mode,
+                kill_priv,
+                flags,
+                umask,
+                extensions,
+            );
+        } else {
+            #[cfg(feature = "iouring")]
+            {
+                res = self
+                    .fs
+                    .create_async(
+                        Context::from(in_header),
+                        in_header.nodeid.into(),
+                        bytes_to_cstr(name)?,
+                        mode,
+                        kill_priv,
+                        flags,
+                        umask,
+                        extensions,
+                    )
+                    .await;
+            }
+            #[cfg(not(feature = "iouring"))]
+            {
+                unreachable!("async create requires the iouring feature")
+            }
+        }
+
+        match res {
             Ok((entry, handle, opts)) => {
                 let entry_out = EntryOut::from(entry);
                 let open_out = OpenOut {
