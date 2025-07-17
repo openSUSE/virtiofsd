@@ -26,6 +26,8 @@ test:
   script:
     - rustc --version && cargo --version  # Print version info for debugging
     - RUSTFLAGS='-C target-feature=+crt-static -C link-self-contained=yes' LIBSECCOMP_LINK_TYPE=static LIBSECCOMP_LIB_PATH=/usr/lib LIBCAPNG_LINK_TYPE=static LIBCAPNG_LIB_PATH=/usr/lib cargo build --verbose --target x86_64-unknown-linux-musl
+    # Build without 'iouring' feature
+    - RUSTFLAGS='-C target-feature=+crt-static -C link-self-contained=yes' LIBSECCOMP_LINK_TYPE=static LIBSECCOMP_LIB_PATH=/usr/lib LIBCAPNG_LINK_TYPE=static LIBCAPNG_LIB_PATH=/usr/lib cargo build --no-default-features --features seccomp --verbose --target x86_64-unknown-linux-musl
     - RUSTFLAGS='-C target-feature=+crt-static -C link-self-contained=yes' LIBSECCOMP_LINK_TYPE=static LIBSECCOMP_LIB_PATH=/usr/lib LIBCAPNG_LINK_TYPE=static LIBCAPNG_LIB_PATH=/usr/lib cargo test --verbose --target x86_64-unknown-linux-musl
   except:
       # There is an equivalent job ('publish') that will run when code lands
