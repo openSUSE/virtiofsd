@@ -10,6 +10,8 @@ pub mod file_handle;
 mod guest_fd_limit;
 pub mod inode_store;
 pub mod mount_fd;
+#[cfg(feature = "iouring")]
+pub mod personality_store;
 pub mod read_only;
 pub mod smol_wrapper;
 pub mod stat;
