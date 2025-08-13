@@ -229,7 +229,7 @@ interpreted as two options, instead of the intended `--modcaps=-mknod`.
 ```shell
 --sandbox <sandbox>
 ```
-Sandbox mechanism to isolate the daemon process (namespace, chroot, none).
+Sandbox mechanism to isolate the daemon process (namespace, chroot, landlock, none).
 
 - **namespace**: The program switches into a new file system
 namespace (`namespaces(7)`) and invokes `pivot_root(2)` to make the shared directory
@@ -240,6 +240,12 @@ net namespace (`network_namespaces(7)`) is also created to isolate the process.
 directory tree its root. This mode is intended for container environments where
 the container runtime has already set up the namespaces and the program does
 not have permission to create namespaces itself.
+
+- **landlock**: The program restricts itself with Landlock
+([https://landlock.io/](https://landlock.io/)), a Linux kernel security feature. The restriction
+is best-effort, meaning that it will enable all available access right rules of the Landlock version
+found on the system. Does not require special privileges. Currently, incompatible with
+`inode-file-handles != never`.
 
 - **none**: Do not isolate the daemon (not recommended).
 

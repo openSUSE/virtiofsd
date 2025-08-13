@@ -10,6 +10,7 @@ pub mod file_traits;
 pub mod filesystem;
 pub mod fuse;
 pub mod idmap;
+pub(crate) mod landlock;
 pub mod limits;
 pub mod macros;
 pub mod oslib;
