@@ -110,7 +110,7 @@ where
                 }
                 guard.ring.completion().collect()
             };
-            if !Self::complete_tasks_cqes(cqes, state, executor) {
+            if !self.complete_tasks_cqes(cqes, state, executor) {
                 return;
             }
         }
@@ -121,6 +121,7 @@ where
     /// For example, if a short read/write occurs, it results in another submission
     /// within the same task.
     fn complete_tasks_cqes(
+        &self,
         cqes: Vec<cqueue::Entry>,
         state: &Arc<Mutex<IoUringState>>,
         executor: &Arc<Executor<'static>>,
@@ -135,9 +136,13 @@ where
                 IoUringAwait::process_cqe(cqe);
             }
         }
-        loop {
-            if !executor.try_tick() {
-                break;
+        if self.pool.is_none() {
+            // `IoUringAwait::process_cqe` may have awakened some tasks, in the executor.
+            // We need to tick them if we don't have executors in other threads.
+            loop {
+                if !executor.try_tick() {
+                    break;
+                }
             }
         }
         submission_batching_guard.submit_and_drop()
@@ -191,9 +196,13 @@ where
                     })
                     .detach();
             }
-            loop {
-                if !executor.try_tick() {
-                    break;
+            if self.pool.is_none() {
+                // We spawned some tasks in the executor, so we need to tick them
+                // if we don't have executors in other threads.
+                loop {
+                    if !executor.try_tick() {
+                        break;
+                    }
                 }
             }
         }
