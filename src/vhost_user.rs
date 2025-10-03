@@ -16,6 +16,8 @@ use futures::executor::{ThreadPool, ThreadPoolBuilder};
 use libc::EFD_NONBLOCK;
 use log::*;
 
+#[cfg(feature = "iouring")]
+use smol::future;
 use vhost::vhost_user::message::*;
 use vhost::vhost_user::Backend;
 use vhost_user_backend::bitmap::BitmapMmapRegion;
@@ -141,11 +143,7 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
         thread_pool_size: usize,
         #[cfg(feature = "iouring")] io_uring_runtime: Option<IoUringRuntimeWithEventFd>,
     ) -> Result<Self> {
-        #[cfg(feature = "iouring")]
-        let use_thread_pool = thread_pool_size > 0 && io_uring_runtime.is_none();
-        #[cfg(not(feature = "iouring"))]
-        let use_thread_pool = thread_pool_size > 0;
-        let pool = if use_thread_pool {
+        if thread_pool_size > 0 {
             // Test that unshare(CLONE_FS) works, it will be called for each thread.
             // It's an unprivileged system call but some Docker/Moby versions are
             // known to reject it via seccomp when CAP_SYS_ADMIN is not given.
@@ -156,7 +154,12 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
             if ret == -1 {
                 return Err(Error::UnshareCloneFs(std::io::Error::last_os_error()));
             }
-
+        }
+        #[cfg(feature = "iouring")]
+        let use_thread_pool = thread_pool_size > 0 && io_uring_runtime.is_none();
+        #[cfg(not(feature = "iouring"))]
+        let use_thread_pool = thread_pool_size > 0;
+        let pool = if use_thread_pool {
             Some(
                 ThreadPoolBuilder::new()
                     .after_start(|_| {
@@ -173,8 +176,22 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
         };
         #[cfg(feature = "iouring")]
         match io_uring_runtime {
-            Some(_) if thread_pool_size > 0 => {
-                todo!("Cannot use both io_uring and a thread pool");
+            Some(ref runtime) if thread_pool_size > 0 => {
+                for i in 0..thread_pool_size {
+                    let executor = Arc::clone(&runtime.io_uring_runtime.executor);
+                    std::thread::spawn(move || {
+                        log::debug!("Spawning a thread({}) to handle io_uring events", i);
+                        // unshare FS for xattr operation
+                        let ret = unsafe { libc::unshare(libc::CLONE_FS) };
+                        assert_eq!(ret, 0); // Should not fail
+
+                        // Run `executor` until the given future completes, i.e. forever.
+                        // This will not only run the `pending` future, but any future spawned on the
+                        // executor from elsewhere (i.e. from `VhostUserFsThread::process_queue_async()`)
+                        // – unless another thread grabbed it before this one.
+                        future::block_on(executor.run(future::pending::<()>()));
+                    });
+                }
             }
             _ => {}
         };
