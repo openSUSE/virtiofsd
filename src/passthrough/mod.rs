@@ -525,6 +525,10 @@ pub struct PassthroughFs {
     /// io_uring personality IDs.
     #[cfg(feature = "iouring")]
     personality_store: PersonalityStore,
+
+    /// The probe of the io_uring instance. `probe` is `None` if we failed to perform probe.
+    #[cfg(feature = "iouring")]
+    probe: Option<io_uring::Probe>,
 }
 
 impl PassthroughFs {
@@ -578,10 +582,27 @@ impl PassthroughFs {
         };
 
         #[cfg(feature = "iouring")]
-        let (io_uring_runtime, io_uring_eventfd) = if let Some(r) = io_uring_runtime {
-            (Some(r.runtime().clone()), Some(r.event_fd()))
+        let (io_uring_runtime, io_uring_eventfd, probe) = if let Some(r) = io_uring_runtime {
+            let runtime = r.runtime().clone();
+            let mut probe = io_uring::Probe::new();
+            let probe = match runtime
+                .state
+                .lock()
+                .expect("Lock poisoned: another thread must have panicked")
+                .ring
+                .submitter()
+                .register_probe(&mut probe)
+            {
+                Ok(_) => Some(probe),
+                Err(_) => {
+                    // In case of error, we assume kernel does not support `IORING_REGISTER_PROBE`.
+                    log::warn!("Failed to register io_uring probe, assuming kernel does not support IORING_REGISTER_PROBE, and virtiofsd will skip io_uring opcode availability checks.");
+                    None
+                }
+            };
+            (Some(runtime), Some(r.event_fd()), probe)
         } else {
-            (None, None)
+            (None, None, None)
         };
         let mut fs = PassthroughFs {
             inodes: Default::default(),
@@ -605,6 +626,8 @@ impl PassthroughFs {
             io_uring_runtime,
             #[cfg(feature = "iouring")]
             personality_store: PersonalityStore::new(),
+            #[cfg(feature = "iouring")]
+            probe,
         };
 
         // Check to see if the client remapped "security.capability", if so,
@@ -635,6 +658,13 @@ impl PassthroughFs {
 
     fn switch_to_proc_self_fd(&self) -> ScopedWorkingDirectory {
         ScopedWorkingDirectory::new(self.proc_self_fd.as_raw_fd(), self.orig_wd_fd.as_raw_fd())
+    }
+
+    /// Returns true if the given io_uring opcode is supported by the kernel, according to the probe.
+    /// If we have failed to perform probe, we optimistically assume all opcodes are supported.
+    #[cfg(feature = "iouring")]
+    pub fn is_io_uring_op_supported(&self, opcode: u8) -> bool {
+        self.probe.as_ref().is_none_or(|p| p.is_supported(opcode))
     }
 
     #[cfg(feature = "iouring")]
@@ -2064,8 +2094,12 @@ impl FileSystem for PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions)> {
-        self.create_inner_async(ctx, parent, name, mode, kill_priv, flags, umask, extensions)
-            .await
+        if self.is_io_uring_op_supported(opcode::OpenAt2::CODE) {
+            self.create_inner_async(ctx, parent, name, mode, kill_priv, flags, umask, extensions)
+                .await
+        } else {
+            self.create(ctx, parent, name, mode, kill_priv, flags, umask, extensions)
+        }
     }
 
     fn unlink(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
@@ -2103,8 +2137,12 @@ impl FileSystem for PassthroughFs {
         lock_owner: Option<u64>,
         flags: u32,
     ) -> io::Result<usize> {
-        self.do_read_async(ctx, inode, handle, r, size, offset, lock_owner, flags)
-            .await
+        if self.is_io_uring_op_supported(opcode::Readv::CODE) {
+            self.do_read_async(ctx, inode, handle, r, size, offset, lock_owner, flags)
+                .await
+        } else {
+            self.read(ctx, inode, handle, r, size, offset, lock_owner, flags)
+        }
     }
 
     fn write<R: ZeroCopyReader>(
@@ -2165,19 +2203,34 @@ impl FileSystem for PassthroughFs {
         kill_priv: bool,
         flags: u32,
     ) -> io::Result<usize> {
-        self.do_write_async(
-            ctx,
-            inode,
-            handle,
-            r,
-            size,
-            offset,
-            lock_owner,
-            delayed_write,
-            kill_priv,
-            flags,
-        )
-        .await
+        if self.is_io_uring_op_supported(opcode::Writev::CODE) {
+            self.do_write_async(
+                ctx,
+                inode,
+                handle,
+                r,
+                size,
+                offset,
+                lock_owner,
+                delayed_write,
+                kill_priv,
+                flags,
+            )
+            .await
+        } else {
+            self.write(
+                ctx,
+                inode,
+                handle,
+                r,
+                size,
+                offset,
+                lock_owner,
+                delayed_write,
+                kill_priv,
+                flags,
+            )
+        }
     }
 
     fn getattr(
@@ -2364,8 +2417,12 @@ impl FileSystem for PassthroughFs {
         newname: &CStr,
         flags: u32,
     ) -> io::Result<()> {
-        self.do_rename_async(ctx, olddir, oldname, newdir, newname, flags)
-            .await
+        if self.is_io_uring_op_supported(opcode::RenameAt::CODE) {
+            self.do_rename_async(ctx, olddir, oldname, newdir, newname, flags)
+                .await
+        } else {
+            self.rename(ctx, olddir, oldname, newdir, newname, flags)
+        }
     }
 
     fn mknod(
