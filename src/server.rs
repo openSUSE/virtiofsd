@@ -8,7 +8,7 @@ use crate::filesystem::{
     ListxattrReply, SecContext, SerializableFileSystem, ZeroCopyReader, ZeroCopyWriter,
 };
 use crate::fuse::*;
-use crate::guest_endian::{GuestEndian, SWAP_GUEST_BYTES};
+use crate::guest_endian::{ByteOrder, GuestEndian, GUEST_ENDIAN};
 use crate::passthrough::util::einval;
 use crate::soft_idmap::GuestGid;
 use crate::{oslib, Error, Result};
@@ -110,14 +110,16 @@ impl<F: FileSystem + Sync> Server<F> {
         let in_header: InHeader = r.read_obj().map_err(Error::DecodeMessage)?;
         let buffer_to_big = MAX_BUFFER_SIZE + FUSE_BUFFER_HEADER_SIZE;
 
-        // Auto-detect the endianess of the guest. The length of the init packet
-        // is usually on the order of 0x68, and if the endianess is incorret
-        // this will show as 0x6800_0000, which is quite a bit larger than the
-        // maximum buffer size.
-        if SWAP_GUEST_BYTES.get().is_none() {
-            let _ = SWAP_GUEST_BYTES
-                .get_or_init(|| in_header.len.from_guest() > buffer_to_big);
-        }
+        // Auto-detect the endianness of the guest. The first packet received should
+        // from a well-behaved guest should include the opcode Init(26). We use this
+        // opcode field, as bytes, to decide upon the endianness of the guest
+        let _ = GUEST_ENDIAN.get_or_init(|| {
+            if in_header.opcode.to_bytes() == (Opcode::Init as u32).to_be_bytes() {
+                ByteOrder::Big
+            } else {
+                ByteOrder::Little
+            }
+        });
 
         if in_header.len.from_guest() > buffer_to_big {
             return reply_error(

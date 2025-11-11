@@ -8,8 +8,13 @@ use std::sync::OnceLock;
 
 use crate::soft_idmap::{GuestGid, GuestUid, Id};
 
-/// Is there a difference between the guest's endianness and ours?
-pub(crate) static SWAP_GUEST_BYTES: OnceLock<bool> = OnceLock::new();
+#[derive(PartialEq)]
+pub enum ByteOrder {
+    Little,
+    Big,
+}
+
+pub(crate) static GUEST_ENDIAN: OnceLock<ByteOrder> = OnceLock::new();
 
 /// An integer from the guest, in its native endianness. Use `.from_guest()`
 /// or `.into()` to use the same value in host (our) endianness.
@@ -21,19 +26,26 @@ macro_rules! mk_guest_endian {
     ($base_type:ident) => {
         impl GuestEndian<$base_type> {
             pub fn from_guest(&self) -> $base_type {
-                if let Some(true) = SWAP_GUEST_BYTES.get() {
-                    self.0.swap_bytes()
-                } else {
-                    self.0
+                match GUEST_ENDIAN.get() {
+                    Some(ByteOrder::Big) => $base_type::from_be(self.0),
+                    Some(ByteOrder::Little) => $base_type::from_le(self.0),
+                    None => self.0,
                 }
             }
 
             pub fn new(val: $base_type) -> Self {
-                Self(if let Some(true) = SWAP_GUEST_BYTES.get() {
-                    val.swap_bytes()
-                } else {
-                    val
+                Self(match GUEST_ENDIAN.get() {
+                    Some(ByteOrder::Big) => val.to_be(),
+                    Some(ByteOrder::Little) => val.to_le(),
+                    None => val,
                 })
+            }
+
+            pub fn to_bytes(&self) -> [u8; std::mem::size_of::<$base_type>()] {
+                // Note that since we read this value in from the guest endianness,
+                // when we 'convert' it to native endianness, that will be in guest
+                // endianness. to_ne_bytes could also be read as "as it was in memory"
+                self.0.to_ne_bytes()
             }
         }
         impl From<$base_type> for GuestEndian<$base_type> {
@@ -64,19 +76,32 @@ macro_rules! mk_guest_endian_id {
     ($base_type:ident) => {
         impl GuestEndian<$base_type> {
             pub fn from_guest(&self) -> $base_type {
-                if let Some(true) = SWAP_GUEST_BYTES.get() {
-                    self.0.into_inner().swap_bytes().into()
-                } else {
-                    self.0
+                let inner = self.0.into_inner();
+                match GUEST_ENDIAN.get() {
+                    Some(ByteOrder::Big) => u32::from_be(inner),
+                    Some(ByteOrder::Little) => u32::from_le(inner),
+                    None => inner,
                 }
+                .into()
             }
 
             pub fn new(val: $base_type) -> Self {
-                Self(if let Some(true) = SWAP_GUEST_BYTES.get() {
-                    val.into_inner().swap_bytes().into()
-                } else {
-                    val
-                })
+                let inner = val.into_inner();
+                Self(
+                    match GUEST_ENDIAN.get() {
+                        Some(ByteOrder::Big) => inner.to_be(),
+                        Some(ByteOrder::Little) => inner.to_le(),
+                        None => inner,
+                    }
+                    .into(),
+                )
+            }
+
+            pub fn to_bytes(&self) -> [u8; std::mem::size_of::<$base_type>()] {
+                // Note that since we read this value in from the guest endianness,
+                // when we 'convert' it to native endianness, that will be in guest
+                // endianness. to_ne_bytes could also be read as "as it was in memory"
+                self.0.into_inner().to_ne_bytes()
             }
         }
         impl From<$base_type> for GuestEndian<$base_type> {
