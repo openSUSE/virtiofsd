@@ -522,6 +522,8 @@ fn print_capabilities() {
     println!("  \"type\": \"fs\",");
     println!("  \"features\": [");
     println!("    \"migrate-precopy\",");
+    #[cfg(feature = "iouring")]
+    println!("    \"iouring\",");
     println!("    \"separate-options\"");
     println!("  ]");
     println!("}}");
