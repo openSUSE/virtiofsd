@@ -14,6 +14,7 @@ pub mod limits;
 pub mod macros;
 pub mod oslib;
 pub mod passthrough;
+pub mod rate_limiter;
 pub mod read_dir;
 pub mod sandbox;
 #[cfg(feature = "seccomp")]

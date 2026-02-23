@@ -496,6 +496,13 @@ that phase for an indeterminate amount of time.
 
 This parameter is ignored on the destination side of migration.
 
+```shell
+--fs-ops-limit <fs-ops-limit>
+```
+If set, this parameter throttles operations per second.
+This limit applies to FUSE requests emitted by the VM, which may not correspond directly to data operations.
+No throttling is applied if not set or set to 0.
+
 ### Examples
 Export `/mnt` on vhost-user UNIX domain socket `/tmp/vfsd.sock`:
 
