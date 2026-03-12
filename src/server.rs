@@ -8,6 +8,7 @@ use crate::filesystem::{
     ListxattrReply, SecContext, SerializableFileSystem, ZeroCopyReader, ZeroCopyWriter,
 };
 use crate::fuse::*;
+use crate::guest_endian::{ByteOrder, GuestEndian, GUEST_ENDIAN};
 use crate::passthrough::util::einval;
 use crate::soft_idmap::GuestGid;
 use crate::{oslib, Error, Result};
@@ -107,8 +108,20 @@ impl<F: FileSystem + Sync> Server<F> {
         vu_req: Option<&mut T>,
     ) -> Result<usize> {
         let in_header: InHeader = r.read_obj().map_err(Error::DecodeMessage)?;
+        let buffer_to_big = MAX_BUFFER_SIZE + FUSE_BUFFER_HEADER_SIZE;
 
-        if in_header.len > (MAX_BUFFER_SIZE + FUSE_BUFFER_HEADER_SIZE) {
+        // Auto-detect the endianness of the guest. The first packet received should
+        // from a well-behaved guest should include the opcode Init(26). We use this
+        // opcode field, as bytes, to decide upon the endianness of the guest
+        let _ = GUEST_ENDIAN.get_or_init(|| {
+            if in_header.opcode.to_bytes() == (Opcode::Init as u32).to_be_bytes() {
+                ByteOrder::Big
+            } else {
+                ByteOrder::Little
+            }
+        });
+
+        if in_header.len.from_guest() > buffer_to_big {
             return reply_error(
                 io::Error::from_raw_os_error(libc::ENOMEM),
                 in_header.unique,
@@ -116,10 +129,13 @@ impl<F: FileSystem + Sync> Server<F> {
             );
         }
 
-        if let Ok(opcode) = Opcode::try_from(in_header.opcode) {
+        if let Ok(opcode) = Opcode::try_from(in_header.opcode.from_guest()) {
             debug!(
                 "Received request: opcode={opcode:?} ({}), inode={}, unique={}, pid={}",
-                in_header.opcode, in_header.nodeid, in_header.unique, in_header.pid
+                in_header.opcode.from_guest(),
+                in_header.nodeid.from_guest(),
+                in_header.unique.from_guest(),
+                in_header.pid.from_guest()
             );
             match opcode {
                 Opcode::Lookup => self.lookup(in_header, r, w),
@@ -175,7 +191,8 @@ impl<F: FileSystem + Sync> Server<F> {
         } else {
             debug!(
                 "Received unknown request: opcode={}, inode={}",
-                in_header.opcode, in_header.nodeid
+                in_header.opcode.from_guest(),
+                in_header.nodeid.from_guest()
             );
             reply_error(
                 io::Error::from_raw_os_error(libc::ENOSYS),
@@ -214,7 +231,7 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 
     fn lookup(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
-        let namelen = (in_header.len as usize)
+        let namelen = (in_header.len.from_guest() as usize)
             .checked_sub(size_of::<InHeader>())
             .ok_or(Error::InvalidHeaderLength)?;
 
@@ -224,10 +241,11 @@ impl<F: FileSystem + Sync> Server<F> {
 
         let name = bytes_to_cstr(buf.as_ref())?;
 
-        match self
-            .fs
-            .lookup(Context::from(in_header), in_header.nodeid.into(), name)
-        {
+        match self.fs.lookup(
+            Context::from(in_header),
+            in_header.nodeid.from_guest().into(),
+            name,
+        ) {
             Ok(entry) => {
                 let out = EntryOut::from(entry);
 
@@ -240,8 +258,11 @@ impl<F: FileSystem + Sync> Server<F> {
     fn forget(&self, in_header: InHeader, mut r: Reader) -> Result<usize> {
         let ForgetIn { nlookup } = r.read_obj().map_err(Error::DecodeMessage)?;
 
-        self.fs
-            .forget(Context::from(in_header), in_header.nodeid.into(), nlookup);
+        self.fs.forget(
+            Context::from(in_header),
+            in_header.nodeid.from_guest().into(),
+            nlookup.into(),
+        );
 
         // There is no reply for forget messages.
         Ok(0)
@@ -250,21 +271,22 @@ impl<F: FileSystem + Sync> Server<F> {
     fn getattr(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let GetattrIn { flags, fh, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
-        let handle = if (flags & GETATTR_FH) != 0 {
-            Some(fh.into())
+        let handle = if (flags.from_guest() & GETATTR_FH) != 0 {
+            Some(fh.from_guest().into())
         } else {
             None
         };
 
-        match self
-            .fs
-            .getattr(Context::from(in_header), in_header.nodeid.into(), handle)
-        {
+        match self.fs.getattr(
+            Context::from(in_header),
+            in_header.nodeid.from_guest().into(),
+            handle,
+        ) {
             Ok((attr, timeout)) => {
                 let out = AttrOut {
-                    attr_valid: timeout.as_secs(),
-                    attr_valid_nsec: timeout.subsec_nanos(),
-                    dummy: 0,
+                    attr_valid: timeout.as_secs().into(),
+                    attr_valid_nsec: timeout.subsec_nanos().into(),
+                    dummy: 0.into(),
                     attr,
                 };
                 reply_ok(Some(out), None, in_header.unique, w)
@@ -276,26 +298,26 @@ impl<F: FileSystem + Sync> Server<F> {
     fn setattr(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let setattr_in: SetattrIn = r.read_obj().map_err(Error::DecodeMessage)?;
 
-        let handle = if setattr_in.valid & FATTR_FH != 0 {
-            Some(setattr_in.fh.into())
+        let handle = if setattr_in.valid.from_guest() & FATTR_FH != 0 {
+            Some(setattr_in.fh.from_guest().into())
         } else {
             None
         };
 
-        let valid = SetattrValid::from_bits_truncate(setattr_in.valid);
+        let valid = SetattrValid::from_bits_truncate(setattr_in.valid.into());
 
         match self.fs.setattr(
             Context::from(in_header),
-            in_header.nodeid.into(),
+            in_header.nodeid.from_guest().into(),
             setattr_in,
             handle,
             valid,
         ) {
             Ok((attr, timeout)) => {
                 let out = AttrOut {
-                    attr_valid: timeout.as_secs(),
-                    attr_valid_nsec: timeout.subsec_nanos(),
-                    dummy: 0,
+                    attr_valid: timeout.as_secs().into(),
+                    attr_valid_nsec: timeout.subsec_nanos().into(),
+                    dummy: 0.into(),
                     attr,
                 };
                 reply_ok(Some(out), None, in_header.unique, w)
@@ -305,10 +327,10 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 
     fn readlink(&self, in_header: InHeader, w: Writer) -> Result<usize> {
-        match self
-            .fs
-            .readlink(Context::from(in_header), in_header.nodeid.into())
-        {
+        match self.fs.readlink(
+            Context::from(in_header),
+            in_header.nodeid.from_guest().into(),
+        ) {
             Ok(linkname) => {
                 // We need to disambiguate the option type here even though it is `None`.
                 reply_ok(None::<u8>, Some(&linkname), in_header.unique, w)
@@ -320,7 +342,7 @@ impl<F: FileSystem + Sync> Server<F> {
     fn symlink(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         // Unfortunately the name and linkname are encoded one after another and
         // separated by a nul character.
-        let len = (in_header.len as usize)
+        let len = (in_header.len.from_guest() as usize)
             .checked_sub(size_of::<InHeader>())
             .ok_or(Error::InvalidHeaderLength)?;
         let mut buf = vec![0; len];
@@ -339,7 +361,7 @@ impl<F: FileSystem + Sync> Server<F> {
         match self.fs.symlink(
             Context::from(in_header),
             bytes_to_cstr(linkname)?,
-            in_header.nodeid.into(),
+            in_header.nodeid.from_guest().into(),
             bytes_to_cstr(name)?,
             extensions,
         ) {
@@ -357,7 +379,7 @@ impl<F: FileSystem + Sync> Server<F> {
             mode, rdev, umask, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
 
-        let remaining_len = (in_header.len as usize)
+        let remaining_len = (in_header.len.from_guest() as usize)
             .checked_sub(size_of::<InHeader>())
             .and_then(|l| l.checked_sub(size_of::<MknodIn>()))
             .ok_or(Error::InvalidHeaderLength)?;
@@ -373,11 +395,11 @@ impl<F: FileSystem + Sync> Server<F> {
 
         match self.fs.mknod(
             Context::from(in_header),
-            in_header.nodeid.into(),
+            in_header.nodeid.from_guest().into(),
             bytes_to_cstr(name)?,
-            mode,
-            rdev,
-            umask,
+            mode.into(),
+            rdev.into(),
+            umask.into(),
             extensions,
         ) {
             Ok(entry) => {
@@ -392,7 +414,7 @@ impl<F: FileSystem + Sync> Server<F> {
     fn mkdir(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let MkdirIn { mode, umask } = r.read_obj().map_err(Error::DecodeMessage)?;
 
-        let remaining_len = (in_header.len as usize)
+        let remaining_len = (in_header.len.from_guest() as usize)
             .checked_sub(size_of::<InHeader>())
             .and_then(|l| l.checked_sub(size_of::<MkdirIn>()))
             .ok_or(Error::InvalidHeaderLength)?;
@@ -408,10 +430,10 @@ impl<F: FileSystem + Sync> Server<F> {
 
         match self.fs.mkdir(
             Context::from(in_header),
-            in_header.nodeid.into(),
+            in_header.nodeid.from_guest().into(),
             bytes_to_cstr(name)?,
-            mode,
-            umask,
+            mode.into(),
+            umask.into(),
             extensions,
         ) {
             Ok(entry) => {
@@ -424,7 +446,7 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 
     fn unlink(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
-        let namelen = (in_header.len as usize)
+        let namelen = (in_header.len.from_guest() as usize)
             .checked_sub(size_of::<InHeader>())
             .ok_or(Error::InvalidHeaderLength)?;
         let mut name = vec![0; namelen];
@@ -433,7 +455,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
         match self.fs.unlink(
             Context::from(in_header),
-            in_header.nodeid.into(),
+            in_header.nodeid.from_guest().into(),
             bytes_to_cstr(&name)?,
         ) {
             Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
@@ -442,7 +464,7 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 
     fn rmdir(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
-        let namelen = (in_header.len as usize)
+        let namelen = (in_header.len.from_guest() as usize)
             .checked_sub(size_of::<InHeader>())
             .ok_or(Error::InvalidHeaderLength)?;
         let mut name = vec![0; namelen];
@@ -451,7 +473,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
         match self.fs.rmdir(
             Context::from(in_header),
-            in_header.nodeid.into(),
+            in_header.nodeid.from_guest().into(),
             bytes_to_cstr(&name)?,
         ) {
             Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
@@ -468,7 +490,7 @@ impl<F: FileSystem + Sync> Server<F> {
         mut r: Reader,
         w: Writer,
     ) -> Result<usize> {
-        let buflen = (in_header.len as usize)
+        let buflen = (in_header.len.from_guest() as usize)
             .checked_sub(size_of::<InHeader>())
             .and_then(|l| l.checked_sub(msg_size))
             .ok_or(Error::InvalidHeaderLength)?;
@@ -487,7 +509,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
         match self.fs.rename(
             Context::from(in_header),
-            in_header.nodeid.into(),
+            in_header.nodeid.from_guest().into(),
             bytes_to_cstr(oldname)?,
             newdir.into(),
             bytes_to_cstr(newname)?,
@@ -501,22 +523,31 @@ impl<F: FileSystem + Sync> Server<F> {
     fn rename(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let RenameIn { newdir } = r.read_obj().map_err(Error::DecodeMessage)?;
 
-        self.do_rename(in_header, size_of::<RenameIn>(), newdir, 0, r, w)
+        self.do_rename(in_header, size_of::<RenameIn>(), newdir.into(), 0, r, w)
     }
 
     fn rename2(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let Rename2In { newdir, flags, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
+        let flags = flags.from_guest();
 
         let flags =
             flags & (libc::RENAME_EXCHANGE | libc::RENAME_NOREPLACE | libc::RENAME_WHITEOUT);
 
-        self.do_rename(in_header, size_of::<Rename2In>(), newdir, flags, r, w)
+        self.do_rename(
+            in_header,
+            size_of::<Rename2In>(),
+            newdir.into(),
+            flags,
+            r,
+            w,
+        )
     }
 
     fn link(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let LinkIn { oldnodeid } = r.read_obj().map_err(Error::DecodeMessage)?;
+        let oldnodeid = oldnodeid.from_guest();
 
-        let namelen = (in_header.len as usize)
+        let namelen = (in_header.len.from_guest() as usize)
             .checked_sub(size_of::<InHeader>())
             .and_then(|l| l.checked_sub(size_of::<LinkIn>()))
             .ok_or(Error::InvalidHeaderLength)?;
@@ -527,7 +558,7 @@ impl<F: FileSystem + Sync> Server<F> {
         match self.fs.link(
             Context::from(in_header),
             oldnodeid.into(),
-            in_header.nodeid.into(),
+            in_header.nodeid.from_guest().into(),
             bytes_to_cstr(&name)?,
         ) {
             Ok(entry) => {
@@ -544,18 +575,18 @@ impl<F: FileSystem + Sync> Server<F> {
             flags, open_flags, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
 
-        let kill_priv = open_flags & OPEN_KILL_SUIDGID != 0;
+        let kill_priv = open_flags.from_guest() & OPEN_KILL_SUIDGID != 0;
 
         match self.fs.open(
             Context::from(in_header),
-            in_header.nodeid.into(),
+            in_header.nodeid.from_guest().into(),
             kill_priv,
-            flags,
+            flags.into(),
         ) {
             Ok((handle, opts)) => {
                 let out = OpenOut {
-                    fh: handle.map(Into::into).unwrap_or(0),
-                    open_flags: opts.bits(),
+                    fh: handle.map(Into::into).unwrap_or(0).into(),
+                    open_flags: opts.bits().into(),
                     ..Default::default()
                 };
 
@@ -576,8 +607,8 @@ impl<F: FileSystem + Sync> Server<F> {
             ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
 
-        let owner = if read_flags & READ_LOCKOWNER != 0 {
-            Some(lock_owner)
+        let owner = if read_flags.from_guest() & READ_LOCKOWNER != 0 {
+            Some(lock_owner.into())
         } else {
             None
         };
@@ -587,26 +618,27 @@ impl<F: FileSystem + Sync> Server<F> {
 
         match self.fs.read(
             Context::from(in_header),
-            in_header.nodeid.into(),
-            fh.into(),
+            in_header.nodeid.from_guest().into(),
+            fh.from_guest().into(),
             data_writer,
-            size,
-            offset,
+            size.into(),
+            offset.into(),
             owner,
-            flags,
+            flags.into(),
         ) {
             Ok(count) => {
                 // Don't use `reply_ok` because we need to set a custom size length for the
                 // header.
+                let outlen = size_of::<OutHeader>() + count;
                 let out = OutHeader {
-                    len: (size_of::<OutHeader>() + count) as u32,
-                    error: 0,
+                    len: (outlen as u32).into(),
+                    error: 0.into(),
                     unique: in_header.unique,
                 };
 
                 debug!("Replying OK, header: {out:?}");
                 w.write_all(out.as_slice()).map_err(Error::EncodeMessage)?;
-                Ok(out.len as usize)
+                Ok(outlen)
             }
             Err(e) => reply_error(e, in_header.unique, w),
         }
@@ -622,9 +654,10 @@ impl<F: FileSystem + Sync> Server<F> {
             flags,
             ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
+        let write_flags = write_flags.from_guest();
 
         let owner = if write_flags & WRITE_LOCKOWNER != 0 {
-            Some(lock_owner)
+            Some(lock_owner.into())
         } else {
             None
         };
@@ -636,19 +669,19 @@ impl<F: FileSystem + Sync> Server<F> {
 
         match self.fs.write(
             Context::from(in_header),
-            in_header.nodeid.into(),
-            fh.into(),
+            in_header.nodeid.from_guest().into(),
+            fh.from_guest().into(),
             data_reader,
-            size,
-            offset,
+            size.into(),
+            offset.into(),
             owner,
             delayed_write,
             kill_priv,
-            flags,
+            flags.into(),
         ) {
             Ok(count) => {
                 let out = WriteOut {
-                    size: count as u32,
+                    size: (count as u32).into(),
                     ..Default::default()
                 };
 
@@ -659,10 +692,10 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 
     fn statfs(&self, in_header: InHeader, w: Writer) -> Result<usize> {
-        match self
-            .fs
-            .statfs(Context::from(in_header), in_header.nodeid.into())
-        {
+        match self.fs.statfs(
+            Context::from(in_header),
+            in_header.nodeid.from_guest().into(),
+        ) {
             Ok(st) => reply_ok(Some(Kstatfs::from(st)), None, in_header.unique, w),
             Err(e) => reply_error(e, in_header.unique, w),
         }
@@ -675,19 +708,21 @@ impl<F: FileSystem + Sync> Server<F> {
             release_flags,
             lock_owner,
         } = r.read_obj().map_err(Error::DecodeMessage)?;
+        let fh = fh.from_guest();
+        let release_flags = release_flags.from_guest();
 
         let flush = release_flags & RELEASE_FLUSH != 0;
         let flock_release = release_flags & RELEASE_FLOCK_UNLOCK != 0;
         let lock_owner = if flush || flock_release {
-            Some(lock_owner)
+            Some(lock_owner.into())
         } else {
             None
         };
 
         match self.fs.release(
             Context::from(in_header),
-            in_header.nodeid.into(),
-            flags,
+            in_header.nodeid.from_guest().into(),
+            flags.into(),
             fh.into(),
             flush,
             flock_release,
@@ -702,11 +737,13 @@ impl<F: FileSystem + Sync> Server<F> {
         let FsyncIn {
             fh, fsync_flags, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
+        let fh = fh.from_guest();
+        let fsync_flags = fsync_flags.from_guest();
         let datasync = fsync_flags & 0x1 != 0;
 
         match self.fs.fsync(
             Context::from(in_header),
-            in_header.nodeid.into(),
+            in_header.nodeid.from_guest().into(),
             datasync,
             fh.into(),
         ) {
@@ -736,15 +773,18 @@ impl<F: FileSystem + Sync> Server<F> {
                 SetxattrIn {
                     size,
                     flags,
-                    setxattr_flags: 0,
-                    padding: 0,
+                    setxattr_flags: 0.into(),
+                    padding: 0.into(),
                 },
                 size_of::<SetxattrInCompat>(),
             )
         };
+        let size = size.from_guest();
+        let flags = flags.from_guest();
+        let setxattr_flags = setxattr_flags.from_guest();
 
         // The name and value and encoded one after another and separated by a '\0' character.
-        let len = (in_header.len as usize)
+        let len = (in_header.len.from_guest() as usize)
             .checked_sub(size_of::<InHeader>())
             .and_then(|l| l.checked_sub(setxattrin_size))
             .ok_or(Error::InvalidHeaderLength)?;
@@ -767,7 +807,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
         match self.fs.setxattr(
             Context::from(in_header),
-            in_header.nodeid.into(),
+            in_header.nodeid.from_guest().into(),
             bytes_to_cstr(name)?,
             value,
             flags,
@@ -780,8 +820,9 @@ impl<F: FileSystem + Sync> Server<F> {
 
     fn getxattr(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let GetxattrIn { size, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
+        let size = size.from_guest();
 
-        let namelen = (in_header.len as usize)
+        let namelen = (in_header.len.from_guest() as usize)
             .checked_sub(size_of::<InHeader>())
             .and_then(|l| l.checked_sub(size_of::<GetxattrIn>()))
             .ok_or(Error::InvalidHeaderLength)?;
@@ -799,14 +840,14 @@ impl<F: FileSystem + Sync> Server<F> {
 
         match self.fs.getxattr(
             Context::from(in_header),
-            in_header.nodeid.into(),
+            in_header.nodeid.from_guest().into(),
             bytes_to_cstr(&name)?,
             size,
         ) {
             Ok(GetxattrReply::Value(val)) => reply_ok(None::<u8>, Some(&val), in_header.unique, w),
             Ok(GetxattrReply::Count(count)) => {
                 let out = GetxattrOut {
-                    size: count,
+                    size: count.into(),
                     ..Default::default()
                 };
 
@@ -818,6 +859,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
     fn listxattr(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let GetxattrIn { size, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
+        let size = size.from_guest();
 
         if size > MAX_BUFFER_SIZE {
             return reply_error(
@@ -827,14 +869,15 @@ impl<F: FileSystem + Sync> Server<F> {
             );
         }
 
-        match self
-            .fs
-            .listxattr(Context::from(in_header), in_header.nodeid.into(), size)
-        {
+        match self.fs.listxattr(
+            Context::from(in_header),
+            in_header.nodeid.from_guest().into(),
+            size,
+        ) {
             Ok(ListxattrReply::Names(val)) => reply_ok(None::<u8>, Some(&val), in_header.unique, w),
             Ok(ListxattrReply::Count(count)) => {
                 let out = GetxattrOut {
-                    size: count,
+                    size: count.into(),
                     ..Default::default()
                 };
 
@@ -845,7 +888,7 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 
     fn removexattr(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
-        let namelen = (in_header.len as usize)
+        let namelen = (in_header.len.from_guest() as usize)
             .checked_sub(size_of::<InHeader>())
             .ok_or(Error::InvalidHeaderLength)?;
 
@@ -855,10 +898,11 @@ impl<F: FileSystem + Sync> Server<F> {
 
         let name = bytes_to_cstr(&buf)?;
 
-        match self
-            .fs
-            .removexattr(Context::from(in_header), in_header.nodeid.into(), name)
-        {
+        match self.fs.removexattr(
+            Context::from(in_header),
+            in_header.nodeid.from_guest().into(),
+            name,
+        ) {
             Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
             Err(e) => reply_error(e, in_header.unique, w),
         }
@@ -866,10 +910,12 @@ impl<F: FileSystem + Sync> Server<F> {
 
     fn flush(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let FlushIn { fh, lock_owner, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
+        let fh = fh.from_guest();
+        let lock_owner = lock_owner.from_guest();
 
         match self.fs.flush(
             Context::from(in_header),
-            in_header.nodeid.into(),
+            in_header.nodeid.from_guest().into(),
             fh.into(),
             lock_owner,
         ) {
@@ -886,7 +932,7 @@ impl<F: FileSystem + Sync> Server<F> {
             flags,
         } = r.read_obj().map_err(Error::DecodeMessage)?;
 
-        let options = FsOptions::from_bits_truncate(flags as u64);
+        let options = FsOptions::from_bits_truncate(flags.from_guest() as u64);
 
         let InitInExt { flags2, .. } = if options.contains(FsOptions::INIT_EXT) {
             r.read_obj().map_err(Error::DecodeMessage)?
@@ -894,8 +940,12 @@ impl<F: FileSystem + Sync> Server<F> {
             InitInExt::default()
         };
 
-        if major < KERNEL_VERSION {
-            error!("Unsupported fuse protocol version: {major}.{minor}");
+        if major.from_guest() < KERNEL_VERSION {
+            error!(
+                "Unsupported fuse protocol version: {}.{}",
+                major.from_guest(),
+                minor.from_guest()
+            );
             return reply_error(
                 io::Error::from_raw_os_error(libc::EPROTO),
                 in_header.unique,
@@ -903,19 +953,23 @@ impl<F: FileSystem + Sync> Server<F> {
             );
         }
 
-        if major > KERNEL_VERSION {
+        if major.from_guest() > KERNEL_VERSION {
             // Wait for the kernel to reply back with a 7.X version.
             let out = InitOut {
-                major: KERNEL_VERSION,
-                minor: KERNEL_MINOR_VERSION,
+                major: KERNEL_VERSION.into(),
+                minor: KERNEL_MINOR_VERSION.into(),
                 ..Default::default()
             };
 
             return reply_ok(Some(out), None, in_header.unique, w);
         }
 
-        if minor < MIN_KERNEL_MINOR_VERSION {
-            error!("Unsupported fuse protocol minor version: {major}.{minor}");
+        if minor.from_guest() < MIN_KERNEL_MINOR_VERSION {
+            error!(
+                "Unsupported fuse protocol minor version: {}.{}",
+                major.from_guest(),
+                minor.from_guest()
+            );
             return reply_error(
                 io::Error::from_raw_os_error(libc::EPROTO),
                 in_header.unique,
@@ -937,7 +991,7 @@ impl<F: FileSystem + Sync> Server<F> {
             | FsOptions::CREATE_SUPP_GROUP
             | FsOptions::ALLOW_IDMAP;
 
-        let flags_64 = ((flags2 as u64) << 32) | (flags as u64);
+        let flags_64 = ((flags2.from_guest() as u64) << 32) | (flags.from_guest() as u64);
         let capable = FsOptions::from_bits_truncate(flags_64);
 
         let page_size: u32 = unsafe { libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap() };
@@ -949,17 +1003,17 @@ impl<F: FileSystem + Sync> Server<F> {
                 self.options.store(enabled, Ordering::Relaxed);
 
                 let out = InitOut {
-                    major: KERNEL_VERSION,
-                    minor: KERNEL_MINOR_VERSION,
+                    major: KERNEL_VERSION.into(),
+                    minor: KERNEL_MINOR_VERSION.into(),
                     max_readahead,
-                    flags: enabled as u32,
-                    max_background: u16::MAX,
-                    congestion_threshold: (u16::MAX / 4) * 3,
-                    max_write: MAX_BUFFER_SIZE,
-                    time_gran: 1, // nanoseconds
-                    max_pages: max_pages.try_into().unwrap(),
-                    map_alignment: 0,
-                    flags2: (enabled >> 32) as u32,
+                    flags: (enabled as u32).into(),
+                    max_background: u16::MAX.into(),
+                    congestion_threshold: ((u16::MAX / 4) * 3).into(),
+                    max_write: MAX_BUFFER_SIZE.into(),
+                    time_gran: 1.into(), // nanoseconds
+                    max_pages: <u32 as TryInto<u16>>::try_into(max_pages).unwrap().into(),
+                    map_alignment: 0.into(),
+                    flags2: ((enabled >> 32) as u32).into(),
                     ..Default::default()
                 };
 
@@ -972,14 +1026,15 @@ impl<F: FileSystem + Sync> Server<F> {
     fn opendir(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let OpenIn { flags, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
-        match self
-            .fs
-            .opendir(Context::from(in_header), in_header.nodeid.into(), flags)
-        {
+        match self.fs.opendir(
+            Context::from(in_header),
+            in_header.nodeid.from_guest().into(),
+            flags.into(),
+        ) {
             Ok((handle, opts)) => {
                 let out = OpenOut {
-                    fh: handle.map(Into::into).unwrap_or(0),
-                    open_flags: opts.bits(),
+                    fh: handle.map(Into::into).unwrap_or(0).into(),
+                    open_flags: opts.bits().into(),
                     ..Default::default()
                 };
 
@@ -994,7 +1049,7 @@ impl<F: FileSystem + Sync> Server<F> {
             fh, offset, size, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
 
-        if size > MAX_BUFFER_SIZE {
+        if size.from_guest() > MAX_BUFFER_SIZE {
             return reply_error(
                 io::Error::from_raw_os_error(libc::ENOMEM),
                 in_header.unique,
@@ -1003,7 +1058,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
 
         let available_bytes = w.available_bytes();
-        if available_bytes < size as usize {
+        if available_bytes < size.from_guest() as usize {
             return reply_error(
                 io::Error::from_raw_os_error(libc::ENOMEM),
                 in_header.unique,
@@ -1016,16 +1071,16 @@ impl<F: FileSystem + Sync> Server<F> {
         let mut cursor = w.split_at(size_of::<OutHeader>()).unwrap();
         let result = match self.fs.readdir(
             Context::from(in_header),
-            in_header.nodeid.into(),
-            fh.into(),
-            size,
-            offset,
+            in_header.nodeid.from_guest().into(),
+            fh.from_guest().into(),
+            size.into(),
+            offset.into(),
         ) {
             Ok(mut entries) => {
                 let mut total_written = 0;
                 let mut err = None;
                 while let Some(dirent) = entries.next() {
-                    let remaining = (size as usize).saturating_sub(total_written);
+                    let remaining = (size.from_guest() as usize).saturating_sub(total_written);
                     match add_dirent(&mut cursor, remaining, dirent, None) {
                         // No more space left in the buffer.
                         Ok(0) => break,
@@ -1058,7 +1113,7 @@ impl<F: FileSystem + Sync> Server<F> {
         in_header: &InHeader,
         dir_entry: DirEntry<'d>,
     ) -> io::Result<(DirEntry<'d>, Entry)> {
-        let parent = in_header.nodeid.into();
+        let parent = in_header.nodeid.from_guest().into();
         let name = dir_entry.name.to_bytes();
         let entry = if name == CURRENT_DIR_CSTR || name == PARENT_DIR_CSTR {
             // We use 0 for the inode value to indicate a negative entry.
@@ -1068,8 +1123,8 @@ impl<F: FileSystem + Sync> Server<F> {
                 // Don't do lookups on the current directory or the parent directory, i.e. leave
                 // most fields 0.
                 attr: Attr {
-                    ino: dir_entry.ino,
-                    mode: dir_entry.type_ << 12,
+                    ino: dir_entry.ino.into(),
+                    mode: (dir_entry.type_ << 12).into(),
                     ..Default::default()
                 },
                 attr_timeout: Duration::from_secs(0),
@@ -1088,7 +1143,7 @@ impl<F: FileSystem + Sync> Server<F> {
             fh, offset, size, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
 
-        if size > MAX_BUFFER_SIZE {
+        if size.from_guest() > MAX_BUFFER_SIZE {
             return reply_error(
                 io::Error::from_raw_os_error(libc::ENOMEM),
                 in_header.unique,
@@ -1097,7 +1152,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
 
         let available_bytes = w.available_bytes();
-        if available_bytes < size as usize {
+        if available_bytes < size.from_guest() as usize {
             return reply_error(
                 io::Error::from_raw_os_error(libc::ENOMEM),
                 in_header.unique,
@@ -1110,10 +1165,10 @@ impl<F: FileSystem + Sync> Server<F> {
         let mut cursor = w.split_at(size_of::<OutHeader>()).unwrap();
         let result = match self.fs.readdir(
             Context::from(in_header),
-            in_header.nodeid.into(),
-            fh.into(),
-            size,
-            offset,
+            in_header.nodeid.from_guest().into(),
+            fh.from_guest().into(),
+            size.into(),
+            offset.into(),
         ) {
             Ok(mut entries) => {
                 let mut total_written = 0;
@@ -1123,7 +1178,8 @@ impl<F: FileSystem + Sync> Server<F> {
                     let bytes_written =
                         self.handle_dirent(&in_header, dirent).and_then(|(d, e)| {
                             entry_inode = Some(e.inode);
-                            let remaining = (size as usize).saturating_sub(total_written);
+                            let remaining =
+                                (size.from_guest() as usize).saturating_sub(total_written);
                             add_dirent(&mut cursor, remaining, d, Some(e))
                         });
                     match bytes_written {
@@ -1177,9 +1233,9 @@ impl<F: FileSystem + Sync> Server<F> {
 
         match self.fs.releasedir(
             Context::from(in_header),
-            in_header.nodeid.into(),
-            flags,
-            fh.into(),
+            in_header.nodeid.from_guest().into(),
+            flags.into(),
+            fh.from_guest().into(),
         ) {
             Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
             Err(e) => reply_error(e, in_header.unique, w),
@@ -1190,11 +1246,13 @@ impl<F: FileSystem + Sync> Server<F> {
         let FsyncIn {
             fh, fsync_flags, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
+        let fh = fh.from_guest();
+        let fsync_flags = fsync_flags.from_guest();
         let datasync = fsync_flags & 0x1 != 0;
 
         match self.fs.fsyncdir(
             Context::from(in_header),
-            in_header.nodeid.into(),
+            in_header.nodeid.from_guest().into(),
             datasync,
             fh.into(),
         ) {
@@ -1230,10 +1288,11 @@ impl<F: FileSystem + Sync> Server<F> {
     fn access(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let AccessIn { mask, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
-        match self
-            .fs
-            .access(Context::from(in_header), in_header.nodeid.into(), mask)
-        {
+        match self.fs.access(
+            Context::from(in_header),
+            in_header.nodeid.from_guest().into(),
+            mask.into(),
+        ) {
             Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
             Err(e) => reply_error(e, in_header.unique, w),
         }
@@ -1247,8 +1306,12 @@ impl<F: FileSystem + Sync> Server<F> {
             open_flags,
             ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
+        let flags = flags.from_guest();
+        let mode = mode.from_guest();
+        let umask = umask.from_guest();
+        let open_flags = open_flags.from_guest();
 
-        let remaining_len = (in_header.len as usize)
+        let remaining_len = (in_header.len.from_guest() as usize)
             .checked_sub(size_of::<InHeader>())
             .and_then(|l| l.checked_sub(size_of::<CreateIn>()))
             .ok_or(Error::InvalidHeaderLength)?;
@@ -1267,7 +1330,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
         match self.fs.create(
             Context::from(in_header),
-            in_header.nodeid.into(),
+            in_header.nodeid.from_guest().into(),
             bytes_to_cstr(name)?,
             mode,
             kill_priv,
@@ -1278,8 +1341,8 @@ impl<F: FileSystem + Sync> Server<F> {
             Ok((entry, handle, opts)) => {
                 let entry_out = EntryOut::from(entry);
                 let open_out = OpenOut {
-                    fh: handle.map(Into::into).unwrap_or(0),
-                    open_flags: opts.bits(),
+                    fh: handle.map(Into::into).unwrap_or(0).into(),
+                    open_flags: opts.bits().into(),
                     ..Default::default()
                 };
 
@@ -1343,6 +1406,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
     fn batch_forget(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let BatchForgetIn { count, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
+        let count = count.from_guest();
 
         if let Some(size) = (count as usize).checked_mul(size_of::<ForgetOne>()) {
             if size > MAX_BUFFER_SIZE as usize {
@@ -1364,7 +1428,7 @@ impl<F: FileSystem + Sync> Server<F> {
         for _ in 0..count {
             requests.push(
                 r.read_obj::<ForgetOne>()
-                    .map(|f| (f.nodeid.into(), f.nlookup))
+                    .map(|f| (f.nodeid.from_guest().into(), f.nlookup.into()))
                     .map_err(Error::DecodeMessage)?,
             );
         }
@@ -1386,11 +1450,11 @@ impl<F: FileSystem + Sync> Server<F> {
 
         match self.fs.fallocate(
             Context::from(in_header),
-            in_header.nodeid.into(),
-            fh.into(),
-            mode,
-            offset,
-            length,
+            in_header.nodeid.from_guest().into(),
+            fh.from_guest().into(),
+            mode.into(),
+            offset.into(),
+            length.into(),
         ) {
             Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
             Err(e) => reply_error(e, in_header.unique, w),
@@ -1404,13 +1468,15 @@ impl<F: FileSystem + Sync> Server<F> {
 
         match self.fs.lseek(
             Context::from(in_header),
-            in_header.nodeid.into(),
-            fh.into(),
-            offset,
-            whence,
+            in_header.nodeid.from_guest().into(),
+            fh.from_guest().into(),
+            offset.into(),
+            whence.into(),
         ) {
             Ok(offset) => {
-                let out = LseekOut { offset };
+                let out = LseekOut {
+                    offset: offset.into(),
+                };
 
                 reply_ok(Some(out), None, in_header.unique, w)
             }
@@ -1432,18 +1498,18 @@ impl<F: FileSystem + Sync> Server<F> {
 
         match self.fs.copyfilerange(
             Context::from(in_header),
-            in_header.nodeid.into(),
-            fh_in.into(),
-            off_in,
-            nodeid_out.into(),
-            fh_out.into(),
-            off_out,
-            len,
-            flags,
+            in_header.nodeid.from_guest().into(),
+            fh_in.from_guest().into(),
+            off_in.into(),
+            nodeid_out.from_guest().into(),
+            fh_out.from_guest().into(),
+            off_out.into(),
+            len.into(),
+            flags.into(),
         ) {
             Ok(count) => {
                 let out = WriteOut {
-                    size: count as u32,
+                    size: (count as u32).into(),
                     ..Default::default()
                 };
 
@@ -1454,10 +1520,10 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 
     fn syncfs(&self, in_header: InHeader, w: Writer) -> Result<usize> {
-        match self
-            .fs
-            .syncfs(Context::from(in_header), in_header.nodeid.into())
-        {
+        match self.fs.syncfs(
+            Context::from(in_header),
+            in_header.nodeid.from_guest().into(),
+        ) {
             Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
             Err(e) => reply_error(e, in_header.unique, w),
         }
@@ -1487,23 +1553,24 @@ impl<F: FileSystem + SerializableFileSystem + Sync> SerializableFileSystem for S
     }
 }
 
-fn reply_readdir(len: usize, unique: u64, mut w: Writer) -> Result<usize> {
+fn reply_readdir(len: usize, unique: GuestEndian<u64>, mut w: Writer) -> Result<usize> {
+    let outlen = size_of::<OutHeader>() + len;
     let out = OutHeader {
-        len: (size_of::<OutHeader>() + len) as u32,
-        error: 0,
+        len: (outlen as u32).into(),
+        error: 0.into(),
         unique,
     };
 
     debug!("Replying OK, header: {out:?}");
     w.write_all(out.as_slice()).map_err(Error::EncodeMessage)?;
     w.flush().map_err(Error::FlushMessage)?;
-    Ok(out.len as usize)
+    Ok(outlen)
 }
 
 fn reply_ok<T: ByteValued>(
     out: Option<T>,
     data: Option<&[u8]>,
-    unique: u64,
+    unique: GuestEndian<u64>,
     mut w: Writer,
 ) -> Result<usize> {
     let mut len = size_of::<OutHeader>();
@@ -1517,8 +1584,8 @@ fn reply_ok<T: ByteValued>(
     }
 
     let header = OutHeader {
-        len: len as u32,
-        error: 0,
+        len: (len as u32).into(),
+        error: (0).into(),
         unique,
     };
 
@@ -1554,25 +1621,25 @@ fn strerror(error: i32) -> String {
     String::from_utf8(err_desc.to_vec()).unwrap_or_else(|_| "".to_owned())
 }
 
-fn reply_error(e: io::Error, unique: u64, mut w: Writer) -> Result<usize> {
+fn reply_error(e: io::Error, unique: GuestEndian<u64>, mut w: Writer) -> Result<usize> {
     let header = OutHeader {
-        len: size_of::<OutHeader>() as u32,
-        error: -e.raw_os_error().unwrap_or(libc::EIO),
+        len: (size_of::<OutHeader>() as u32).into(),
+        error: (-e.raw_os_error().unwrap_or(libc::EIO)).into(),
         unique,
     };
 
     debug!(
         "Replying ERROR, header: OutHeader {{ error: {} ({}), unique: {}, len: {} }}",
-        header.error,
-        strerror(-header.error),
-        header.unique,
-        header.len
+        header.error.from_guest(),
+        strerror(-header.error.from_guest()),
+        header.unique.from_guest(),
+        header.len.from_guest()
     );
 
     w.write_all(header.as_slice())
         .map_err(Error::EncodeMessage)?;
 
-    debug_assert_eq!(header.len as usize, w.bytes_written());
+    debug_assert_eq!(header.len.from_guest() as usize, w.bytes_written());
     Ok(w.bytes_written())
 }
 
@@ -1621,10 +1688,10 @@ fn add_dirent(
         }
 
         let dirent = Dirent {
-            ino: d.ino,
-            off: d.offset,
-            namelen: name.len() as u32,
-            type_: d.type_,
+            ino: d.ino.into(),
+            off: d.offset.into(),
+            namelen: (name.len() as u32).into(),
+            type_: d.type_.into(),
         };
 
         cursor.write_all(dirent.as_slice())?;
@@ -1665,7 +1732,7 @@ fn parse_security_context(nr_secctx: u32, data: &[u8]) -> Result<Option<SecConte
 
     let (secctx, data) = take_object::<Secctx>(data)?;
 
-    if secctx.size == 0 {
+    if secctx.size.from_guest() == 0 {
         return Err(Error::DecodeMessage(einval()));
     }
 
@@ -1673,7 +1740,7 @@ fn parse_security_context(nr_secctx: u32, data: &[u8]) -> Result<Option<SecConte
     let secctx_name = components.next().ok_or(Error::MissingParameter)?;
     let (_, data) = data.split_at(secctx_name.len());
 
-    if data.len() < secctx.size as usize {
+    if data.len() < secctx.size.from_guest() as usize {
         return Err(Error::DecodeMessage(einval()));
     }
 
@@ -1683,7 +1750,7 @@ fn parse_security_context(nr_secctx: u32, data: &[u8]) -> Result<Option<SecConte
     // we ever parse more data after secctx, we will have to take those
     // null bytes into account. Total size (including null bytes) is
     // available in SecctxHeader->size.
-    let (remaining, _) = data.split_at(secctx.size as usize);
+    let (remaining, _) = data.split_at(secctx.size.from_guest() as usize);
 
     let fuse_secctx = SecContext {
         name: CString::from_vec_with_nul(secctx_name.to_vec()).map_err(Error::InvalidCString2)?,
@@ -1698,7 +1765,7 @@ fn parse_sup_groups(data: &[u8]) -> Result<GuestGid> {
 
     // The FUSE extension allows sending several group IDs, but currently the guest
     // kernel only sends one.
-    if group_header.nr_groups != 1 {
+    if group_header.nr_groups.from_guest() != 1 {
         return Err(Error::DecodeMessage(einval()));
     }
 
@@ -1728,14 +1795,14 @@ fn get_extensions(options: FsOptions, skip: usize, request_bytes: &[u8]) -> Resu
     while !buf.is_empty() {
         let (extension_header, remaining_bytes) = take_object::<ExtHeader>(buf)?;
 
-        let extension_size = (extension_header.size as usize)
+        let extension_size = (extension_header.size.from_guest() as usize)
             .checked_sub(size_of::<ExtHeader>())
             .ok_or(Error::InvalidHeaderLength)?;
 
         let (current_extension_bytes, next_extension_bytes) =
             remaining_bytes.split_at(extension_size);
 
-        let ext_type = ExtType::try_from(extension_header.ext_type)
+        let ext_type = ExtType::try_from(extension_header.ext_type.from_guest())
             .map_err(|_| Error::DecodeMessage(einval()))?;
 
         match ext_type {

@@ -9,6 +9,7 @@ pub mod descriptor_utils;
 pub mod file_traits;
 pub mod filesystem;
 pub mod fuse;
+pub mod guest_endian;
 pub mod idmap;
 pub mod limits;
 pub mod macros;

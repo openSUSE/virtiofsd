@@ -5,6 +5,7 @@
 use std::convert::TryFrom;
 use std::io;
 
+use crate::guest_endian_struct;
 use crate::macros::enum_value;
 use crate::soft_idmap::{GuestGid, GuestUid, HostGid, HostUid};
 use bitflags::bitflags;
@@ -581,25 +582,27 @@ bitflags! {
 // Message definitions follow.  It is safe to implement ByteValued for all of these
 // because they are POD types.
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct Attr {
-    pub ino: u64,
-    pub size: u64,
-    pub blocks: u64,
-    pub atime: u64,
-    pub mtime: u64,
-    pub ctime: u64,
-    pub atimensec: u32,
-    pub mtimensec: u32,
-    pub ctimensec: u32,
-    pub mode: u32,
-    pub nlink: u32,
-    pub uid: GuestUid,
-    pub gid: GuestGid,
-    pub rdev: u32,
-    pub blksize: u32,
-    pub flags: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct Attr {
+        pub ino: u64,
+        pub size: u64,
+        pub blocks:u64,
+        pub atime: u64,
+        pub mtime: u64,
+        pub ctime: u64,
+        pub atimensec: u32,
+        pub mtimensec: u32,
+        pub ctimensec: u32,
+        pub mode: u32,
+        pub nlink: u32,
+        pub uid: GuestUid,
+        pub gid: GuestGid,
+        pub rdev: u32,
+        pub blksize: u32,
+        pub flags: u32,
+    }
 }
 unsafe impl ByteValued for Attr {}
 
@@ -638,65 +641,69 @@ impl Attr {
         let gid = gid_map(HostGid::from(st.st_gid))?;
 
         Ok(Attr {
-            ino: st.st_ino,
-            size: st.st_size as u64,
-            blocks: st.st_blocks as u64,
-            atime: st.st_atime as u64,
-            mtime: st.st_mtime as u64,
-            ctime: st.st_ctime as u64,
-            atimensec: st.st_atime_nsec as u32,
-            mtimensec: st.st_mtime_nsec as u32,
-            ctimensec: st.st_ctime_nsec as u32,
-            mode: st.st_mode,
-            nlink: st.st_nlink as u32,
-            uid,
-            gid,
-            rdev: st.st_rdev as u32,
-            blksize: st.st_blksize as u32,
-            flags,
+            ino: st.st_ino.into(),
+            size: (st.st_size as u64).into(),
+            blocks: (st.st_blocks as u64).into(),
+            atime: (st.st_atime as u64).into(),
+            mtime: (st.st_mtime as u64).into(),
+            ctime: (st.st_ctime as u64).into(),
+            atimensec: (st.st_atime_nsec as u32).into(),
+            mtimensec: (st.st_mtime_nsec as u32).into(),
+            ctimensec: (st.st_ctime_nsec as u32).into(),
+            mode: st.st_mode.into(),
+            nlink: (st.st_nlink as u32).into(),
+            uid: uid.into(),
+            gid: gid.into(),
+            rdev: (st.st_rdev as u32).into(),
+            blksize: (st.st_blksize as u32).into(),
+            flags: flags.into(),
         })
     }
 }
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct Kstatfs {
-    pub blocks: u64,
-    pub bfree: u64,
-    pub bavail: u64,
-    pub files: u64,
-    pub ffree: u64,
-    pub bsize: u32,
-    pub namelen: u32,
-    pub frsize: u32,
-    pub padding: u32,
-    pub spare: [u32; 6],
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct Kstatfs {
+        pub blocks: u64,
+        pub bfree: u64,
+        pub bavail: u64,
+        pub files: u64,
+        pub ffree: u64,
+        pub bsize: u32,
+        pub namelen: u32,
+        pub frsize: u32,
+        pub padding: u32,
+        pub spare: [u32; 6],
+    }
 }
 unsafe impl ByteValued for Kstatfs {}
 
 impl From<libc::statvfs64> for Kstatfs {
     fn from(st: libc::statvfs64) -> Self {
         Kstatfs {
-            blocks: st.f_blocks,
-            bfree: st.f_bfree,
-            bavail: st.f_bavail,
-            files: st.f_files,
-            ffree: st.f_ffree,
-            bsize: st.f_bsize as u32,
-            namelen: st.f_namemax as u32,
-            frsize: st.f_frsize as u32,
+            blocks: st.f_blocks.into(),
+            bfree: st.f_bfree.into(),
+            bavail: st.f_bavail.into(),
+            files: st.f_files.into(),
+            ffree: st.f_ffree.into(),
+            bsize: (st.f_bsize as u32).into(),
+            namelen: (st.f_namemax as u32).into(),
+            frsize: (st.f_frsize as u32).into(),
             ..Default::default()
         }
     }
 }
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct FileLock {
-    pub start: u64,
-    pub end: u64,
-    pub type_: u32,
-    pub pid: u32, /* tgid */
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct FileLock {
+        pub start: u64,
+        pub end: u64,
+        pub type_: u32,
+        pub pid: u32, /* tgid */
+    }
 }
 unsafe impl ByteValued for FileLock {}
 
@@ -767,455 +774,550 @@ pub enum NotifyOpcode {
     CodeMax = 7,
 }
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct EntryOut {
-    pub nodeid: u64,      /* Inode ID */
-    pub generation: u64,  /* Inode generation: nodeid:gen must be unique for the fs's lifetime */
-    pub entry_valid: u64, /* Cache timeout for the name */
-    pub attr_valid: u64,  /* Cache timeout for the attributes */
-    pub entry_valid_nsec: u32,
-    pub attr_valid_nsec: u32,
-    pub attr: Attr,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct EntryOut {
+        pub nodeid: u64,      /* Inode ID */
+        pub generation: u64, /* Inode generation: nodeid:gen must be unique for the fs's lifetime */
+        pub entry_valid: u64, /* Cache timeout for the name */
+        pub attr_valid: u64, /* Cache timeout for the attributes */
+        pub entry_valid_nsec: u32,
+        pub attr_valid_nsec: u32,
+        pub attr: Attr,
+    }
 }
 unsafe impl ByteValued for EntryOut {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct ForgetIn {
-    pub nlookup: u64,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct ForgetIn {
+        pub nlookup: u64,
+    }
 }
 unsafe impl ByteValued for ForgetIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct ForgetOne {
-    pub nodeid: u64,
-    pub nlookup: u64,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct ForgetOne {
+        pub nodeid: u64,
+        pub nlookup: u64,
+    }
 }
 unsafe impl ByteValued for ForgetOne {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct BatchForgetIn {
-    pub count: u32,
-    pub dummy: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct BatchForgetIn {
+        pub count: u32,
+        pub dummy: u32,
+    }
 }
 unsafe impl ByteValued for BatchForgetIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct GetattrIn {
-    pub flags: u32,
-    pub dummy: u32,
-    pub fh: u64,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct GetattrIn {
+        pub flags: u32,
+        pub dummy: u32,
+        pub fh: u64,
+    }
 }
 unsafe impl ByteValued for GetattrIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct AttrOut {
-    pub attr_valid: u64, /* Cache timeout for the attributes */
-    pub attr_valid_nsec: u32,
-    pub dummy: u32,
-    pub attr: Attr,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct AttrOut {
+        pub attr_valid: u64, /* Cache timeout for the attributes */
+        pub attr_valid_nsec: u32,
+        pub dummy: u32,
+        pub attr: Attr,
+    }
 }
 unsafe impl ByteValued for AttrOut {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct MknodIn {
-    pub mode: u32,
-    pub rdev: u32,
-    pub umask: u32,
-    pub padding: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct MknodIn {
+        pub mode: u32,
+        pub rdev: u32,
+        pub umask: u32,
+        pub padding: u32,
+    }
 }
 unsafe impl ByteValued for MknodIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct MkdirIn {
-    pub mode: u32,
-    pub umask: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct MkdirIn {
+        pub mode: u32,
+        pub umask: u32,
+    }
 }
 unsafe impl ByteValued for MkdirIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct RenameIn {
-    pub newdir: u64,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct RenameIn {
+        pub newdir: u64,
+    }
 }
 unsafe impl ByteValued for RenameIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct Rename2In {
-    pub newdir: u64,
-    pub flags: u32,
-    pub padding: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct Rename2In {
+        pub newdir: u64,
+        pub flags: u32,
+        pub padding: u32,
+    }
 }
 unsafe impl ByteValued for Rename2In {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct LinkIn {
-    pub oldnodeid: u64,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct LinkIn {
+        pub oldnodeid: u64,
+    }
 }
 unsafe impl ByteValued for LinkIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct SetattrIn {
-    pub valid: u32,
-    pub padding: u32,
-    pub fh: u64,
-    pub size: u64,
-    pub lock_owner: u64,
-    pub atime: u64,
-    pub mtime: u64,
-    pub ctime: u64,
-    pub atimensec: u32,
-    pub mtimensec: u32,
-    pub ctimensec: u32,
-    pub mode: u32,
-    pub unused4: u32,
-    pub uid: GuestUid,
-    pub gid: GuestGid,
-    pub unused5: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct SetattrIn {
+        pub valid: u32,
+        pub padding: u32,
+        pub fh: u64,
+        pub size: u64,
+        pub lock_owner: u64,
+        pub atime: u64,
+        pub mtime: u64,
+        pub ctime: u64,
+        pub atimensec: u32,
+        pub mtimensec: u32,
+        pub ctimensec: u32,
+        pub mode: u32,
+        pub unused4: u32,
+        pub uid: GuestUid,
+        pub gid: GuestGid,
+        pub unused5: u32,
+    }
 }
 unsafe impl ByteValued for SetattrIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct OpenIn {
-    pub flags: u32,
-    pub open_flags: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct OpenIn {
+        pub flags: u32,
+        pub open_flags: u32,
+    }
 }
 unsafe impl ByteValued for OpenIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct CreateIn {
-    pub flags: u32,
-    pub mode: u32,
-    pub umask: u32,
-    pub open_flags: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct CreateIn {
+        pub flags: u32,
+        pub mode: u32,
+        pub umask: u32,
+        pub open_flags: u32,
+    }
 }
 unsafe impl ByteValued for CreateIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct OpenOut {
-    pub fh: u64,
-    pub open_flags: u32,
-    pub padding: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct OpenOut {
+        pub fh: u64,
+        pub open_flags: u32,
+        pub padding: u32,
+    }
 }
 unsafe impl ByteValued for OpenOut {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct ReleaseIn {
-    pub fh: u64,
-    pub flags: u32,
-    pub release_flags: u32,
-    pub lock_owner: u64,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct ReleaseIn {
+        pub fh: u64,
+        pub flags: u32,
+        pub release_flags: u32,
+        pub lock_owner: u64,
+    }
 }
 unsafe impl ByteValued for ReleaseIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct FlushIn {
-    pub fh: u64,
-    pub unused: u32,
-    pub padding: u32,
-    pub lock_owner: u64,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct FlushIn {
+        pub fh: u64,
+        pub unused: u32,
+        pub padding: u32,
+        pub lock_owner: u64,
+    }
 }
 unsafe impl ByteValued for FlushIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct ReadIn {
-    pub fh: u64,
-    pub offset: u64,
-    pub size: u32,
-    pub read_flags: u32,
-    pub lock_owner: u64,
-    pub flags: u32,
-    pub padding: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct ReadIn {
+        pub fh: u64,
+        pub offset: u64,
+        pub size: u32,
+        pub read_flags: u32,
+        pub lock_owner: u64,
+        pub flags: u32,
+        pub padding: u32,
+    }
 }
 unsafe impl ByteValued for ReadIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct WriteIn {
-    pub fh: u64,
-    pub offset: u64,
-    pub size: u32,
-    pub write_flags: u32,
-    pub lock_owner: u64,
-    pub flags: u32,
-    pub padding: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct WriteIn {
+        pub fh: u64,
+        pub offset:u64,
+        pub size: u32,
+        pub write_flags: u32,
+        pub lock_owner: u64,
+        pub flags: u32,
+        pub padding: u32,
+    }
 }
 unsafe impl ByteValued for WriteIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct WriteOut {
-    pub size: u32,
-    pub padding: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct WriteOut {
+        pub size: u32,
+        pub padding: u32,
+    }
 }
 unsafe impl ByteValued for WriteOut {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct StatfsOut {
-    pub st: Kstatfs,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct StatfsOut {
+        pub st: Kstatfs,
+    }
 }
 unsafe impl ByteValued for StatfsOut {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct FsyncIn {
-    pub fh: u64,
-    pub fsync_flags: u32,
-    pub padding: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct FsyncIn {
+        pub fh: u64,
+        pub fsync_flags: u32,
+        pub padding: u32,
+    }
 }
 unsafe impl ByteValued for FsyncIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct SetxattrIn {
-    pub size: u32,
-    pub flags: u32,
-    pub setxattr_flags: u32,
-    pub padding: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct SetxattrIn {
+        pub size: u32,
+        pub flags: u32,
+        pub setxattr_flags: u32,
+        pub padding: u32,
+    }
 }
 unsafe impl ByteValued for SetxattrIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct SetxattrInCompat {
-    pub size: u32,
-    pub flags: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct SetxattrInCompat {
+        pub size: u32,
+        pub flags: u32,
+    }
 }
 unsafe impl ByteValued for SetxattrInCompat {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct GetxattrIn {
-    pub size: u32,
-    pub padding: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct GetxattrIn {
+        pub size: u32,
+        pub padding: u32,
+    }
 }
 unsafe impl ByteValued for GetxattrIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct GetxattrOut {
-    pub size: u32,
-    pub padding: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct GetxattrOut {
+        pub size: u32,
+        pub padding: u32,
+    }
 }
 unsafe impl ByteValued for GetxattrOut {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct LkIn {
-    pub fh: u64,
-    pub owner: u64,
-    pub lk: FileLock,
-    pub lk_flags: u32,
-    pub padding: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct LkIn {
+        pub fh: u64,
+        pub owner: u64,
+        pub lk: FileLock,
+        pub lk_flags: u32,
+        pub padding: u32,
+    }
 }
 unsafe impl ByteValued for LkIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct LkOut {
-    pub lk: FileLock,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct LkOut {
+        pub lk: FileLock,
+    }
 }
 unsafe impl ByteValued for LkOut {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct AccessIn {
-    pub mask: u32,
-    pub padding: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct AccessIn {
+        pub mask: u32,
+        pub padding: u32,
+    }
 }
 unsafe impl ByteValued for AccessIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct InitInCompat {
-    pub major: u32,
-    pub minor: u32,
-    pub max_readahead: u32,
-    pub flags: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct InitInCompat {
+        pub major: u32,
+        pub minor: u32,
+        pub max_readahead: u32,
+        pub flags: u32,
+    }
 }
 unsafe impl ByteValued for InitInCompat {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct InitInExt {
-    pub flags2: u32,
-    pub unused: [u32; 11],
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct InitInExt {
+        pub flags2: u32,
+        pub unused: [u32; 11],
+    }
 }
 unsafe impl ByteValued for InitInExt {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct InitOut {
-    pub major: u32,
-    pub minor: u32,
-    pub max_readahead: u32,
-    pub flags: u32,
-    pub max_background: u16,
-    pub congestion_threshold: u16,
-    pub max_write: u32,
-    pub time_gran: u32,
-    pub max_pages: u16,
-    pub map_alignment: u16,
-    pub flags2: u32,
-    pub unused: [u32; 7],
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct InitOut {
+        pub major: u32,
+        pub minor: u32,
+        pub max_readahead: u32,
+        pub flags: u32,
+        pub max_background: u16,
+        pub congestion_threshold: u16,
+        pub max_write: u32,
+        pub time_gran: u32,
+        pub max_pages: u16,
+        pub map_alignment: u16,
+        pub flags2: u32,
+        pub unused: [u32; 7],
+    }
 }
 unsafe impl ByteValued for InitOut {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct InterruptIn {
-    pub unique: u64,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct InterruptIn {
+        pub unique: u64,
+    }
 }
 unsafe impl ByteValued for InterruptIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct BmapIn {
-    pub block: u64,
-    pub blocksize: u32,
-    pub padding: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct BmapIn {
+        pub block: u64,
+        pub blocksize: u32,
+        pub padding: u32,
+    }
 }
 unsafe impl ByteValued for BmapIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct BmapOut {
-    pub block: u64,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct BmapOut {
+        pub block: u64,
+    }
 }
 unsafe impl ByteValued for BmapOut {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct IoctlIn {
-    pub fh: u64,
-    pub flags: u32,
-    pub cmd: u32,
-    pub arg: u64,
-    pub in_size: u32,
-    pub out_size: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct IoctlIn {
+        pub fh: u64,
+        pub flags: u32,
+        pub cmd: u32,
+        pub arg: u64,
+        pub in_size: u32,
+        pub out_size: u32,
+    }
 }
 unsafe impl ByteValued for IoctlIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct IoctlIovec {
-    pub base: u64,
-    pub len: u64,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct IoctlIovec {
+        pub base: u64,
+        pub len: u64,
+    }
 }
 unsafe impl ByteValued for IoctlIovec {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct IoctlOut {
-    pub result: i32,
-    pub flags: u32,
-    pub in_iovs: u32,
-    pub out_iovs: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct IoctlOut {
+        pub result: i32,
+        pub flags: u32,
+        pub in_iovs: u32,
+        pub out_iovs: u32,
+    }
 }
 unsafe impl ByteValued for IoctlOut {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct PollIn {
-    pub fh: u64,
-    pub kh: u64,
-    pub flags: u32,
-    pub events: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct PollIn {
+        pub fh: u64,
+        pub kh: u64,
+        pub flags: u32,
+        pub events: u32,
+    }
 }
 unsafe impl ByteValued for PollIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct PollOut {
-    pub revents: u32,
-    pub padding: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct PollOut {
+        pub revents: u32,
+        pub padding: u32,
+    }
 }
 unsafe impl ByteValued for PollOut {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct NotifyPollWakeupOut {
-    pub kh: u64,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct NotifyPollWakeupOut {
+        pub kh: u64,
+    }
 }
 unsafe impl ByteValued for NotifyPollWakeupOut {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct FallocateIn {
-    pub fh: u64,
-    pub offset: u64,
-    pub length: u64,
-    pub mode: u32,
-    pub padding: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct FallocateIn {
+        pub fh: u64,
+        pub offset: u64,
+        pub length: u64,
+        pub mode: u32,
+        pub padding: u32,
+    }
 }
 unsafe impl ByteValued for FallocateIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct InHeader {
-    pub len: u32,
-    pub opcode: u32,
-    pub unique: u64,
-    pub nodeid: u64,
-    pub uid: GuestUid,
-    pub gid: GuestGid,
-    pub pid: u32,
-    pub total_extlen: u16, // length of extensions in 8-byte units
-    pub padding: u16,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct InHeader {
+        pub len: u32,
+        pub opcode: u32,
+        pub unique: u64, // used as opaque, no need to fix endianess
+        pub nodeid: u64,
+        pub uid: GuestUid,
+        pub gid: GuestGid,
+        pub pid: u32, // only used for printing as far as I can tell
+        // note: unused
+        pub total_extlen: u16, // length of extensions in 8-byte units
+        pub padding: u16,
+    }
 }
 unsafe impl ByteValued for InHeader {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct OutHeader {
-    pub len: u32,
-    pub error: i32,
-    pub unique: u64,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct OutHeader {
+        pub len: u32,
+        pub error: i32,
+        pub unique: u64,
+    }
 }
 unsafe impl ByteValued for OutHeader {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct Dirent {
-    pub ino: u64,
-    pub off: u64,
-    pub namelen: u32,
-    pub type_: u32,
-    // char name[];
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct Dirent {
+        pub ino: u64,
+        pub off: u64,
+        pub namelen: u32,
+        pub type_: u32,
+        // char name[];
+    }
 }
 unsafe impl ByteValued for Dirent {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct Direntplus {
-    pub entry_out: EntryOut,
-    pub dirent: Dirent,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct Direntplus {
+        pub entry_out: EntryOut,
+        pub dirent: Dirent,
+    }
 }
 unsafe impl ByteValued for Direntplus {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct NotifyInvalInodeOut {
-    pub ino: u64,
-    pub off: i64,
-    pub len: i64,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct NotifyInvalInodeOut {
+        pub ino: u64,
+        pub off: i64,
+        pub len: i64,
+    }
 }
 unsafe impl ByteValued for NotifyInvalInodeOut {}
 
@@ -1226,86 +1328,102 @@ bitflags! {
     }
 }
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct NotifyInvalEntryOut {
-    pub parent: u64,
-    pub namelen: u32,
-    pub flags: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct NotifyInvalEntryOut {
+        pub parent: u64,
+        pub namelen: u32,
+        pub flags: u32,
+    }
 }
 unsafe impl ByteValued for NotifyInvalEntryOut {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct NotifyDeleteOut {
-    pub parent: u64,
-    pub child: u64,
-    pub namelen: u32,
-    pub padding: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct NotifyDeleteOut {
+        pub parent: u64,
+        pub child: u64,
+        pub namelen: u32,
+        pub padding: u32,
+    }
 }
 unsafe impl ByteValued for NotifyDeleteOut {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct NotifyStoreOut {
-    pub nodeid: u64,
-    pub offset: u64,
-    pub size: u32,
-    pub padding: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct NotifyStoreOut {
+        pub nodeid: u64,
+        pub offset: u64,
+        pub size: u32,
+        pub padding: u32,
+    }
 }
 unsafe impl ByteValued for NotifyStoreOut {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct Notify_Retrieve_Out {
-    pub notify_unique: u64,
-    pub nodeid: u64,
-    pub offset: u64,
-    pub size: u32,
-    pub padding: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct Notify_Retrieve_Out {
+        pub notify_unique: u64,
+        pub nodeid: u64,
+        pub offset: u64,
+        pub size: u32,
+        pub padding: u32,
+    }
 }
 unsafe impl ByteValued for Notify_Retrieve_Out {}
 
 /* Matches the size of fuse_write_in */
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct NotifyRetrieveIn {
-    pub dummy1: u64,
-    pub offset: u64,
-    pub size: u32,
-    pub dummy2: u32,
-    pub dummy3: u64,
-    pub dummy4: u64,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct NotifyRetrieveIn {
+        pub dummy1: u64,
+        pub offset: u64,
+        pub size: u32,
+        pub dummy2: u32,
+        pub dummy3: u64,
+        pub dummy4: u64,
+    }
 }
 unsafe impl ByteValued for NotifyRetrieveIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct LseekIn {
-    pub fh: u64,
-    pub offset: u64,
-    pub whence: u32,
-    pub padding: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct LseekIn {
+        pub fh: u64,
+        pub offset: u64,
+        pub whence: u32,
+        pub padding: u32,
+    }
 }
 unsafe impl ByteValued for LseekIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct LseekOut {
-    pub offset: u64,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct LseekOut {
+        pub offset: u64,
+    }
 }
 unsafe impl ByteValued for LseekOut {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct CopyfilerangeIn {
-    pub fh_in: u64,
-    pub off_in: u64,
-    pub nodeid_out: u64,
-    pub fh_out: u64,
-    pub off_out: u64,
-    pub len: u64,
-    pub flags: u64,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct CopyfilerangeIn {
+        pub fh_in: u64,
+        pub off_in: u64,
+        pub nodeid_out: u64,
+        pub fh_out: u64,
+        pub off_out: u64,
+        pub len: u64,
+        pub flags: u64,
+    }
 }
 unsafe impl ByteValued for CopyfilerangeIn {}
 
@@ -1319,52 +1437,62 @@ bitflags! {
     }
 }
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct SetupmappingIn {
-    pub fh: u64,
-    pub foffset: u64,
-    pub len: u64,
-    pub flags: u64,
-    pub moffset: u64,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct SetupmappingIn {
+        pub fh: u64,
+        pub foffset: u64,
+        pub len: u64,
+        pub flags: u64,
+        pub moffset: u64,
+    }
 }
 
 unsafe impl ByteValued for SetupmappingIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct RemovemappingIn {
-    pub count: u32,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct RemovemappingIn {
+        pub count: u32,
+    }
 }
 
 unsafe impl ByteValued for RemovemappingIn {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct RemovemappingOne {
-    pub moffset: u64,
-    pub len: u64,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct RemovemappingOne {
+        pub moffset: u64,
+        pub len: u64,
+    }
 }
 
 unsafe impl ByteValued for RemovemappingOne {}
 
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct SyncfsIn {
-    pub padding: u64,
+guest_endian_struct! {
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct SyncfsIn {
+        pub padding: u64,
+    }
 }
 
 unsafe impl ByteValued for SyncfsIn {}
 
+guest_endian_struct! {
 /// Extension header
 /// `size`: total size of this extension including this header
 /// `ext_type`: type of extension
 /// This is made compatible with `SecctxHeader` by using type values > `FUSE_MAX_NR_SECCTX`
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct ExtHeader {
-    pub size: u32,
-    pub ext_type: u32,
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct ExtHeader {
+        pub size: u32,
+        pub ext_type: u32,
+    }
 }
 
 /// Extension types
@@ -1395,39 +1523,45 @@ impl TryFrom<u32> for ExtType {
     }
 }
 
+guest_endian_struct! {
 /// For each security context, send `Secctx` with size of security context
 /// `Secctx` will be followed by security context name and this in turn
 /// will be followed by actual context label.
 /// `Secctx`, name, context
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct Secctx {
-    pub size: u32,
-    pub padding: u32,
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct Secctx {
+        pub size: u32,
+        pub padding: u32,
+    }
 }
 
 unsafe impl ByteValued for Secctx {}
 
+guest_endian_struct! {
 /// Contains the information about how many `Secctx` structures are being
 /// sent and what's the total size of all security contexts (including
 /// size of `SecctxHeader`).
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct SecctxHeader {
-    pub size: u32,
-    pub nr_secctx: u32,
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct SecctxHeader {
+        pub size: u32,
+        pub nr_secctx: u32,
+    }
 }
 
 unsafe impl ByteValued for SecctxHeader {}
 
+guest_endian_struct! {
 /// Supplementary groups extension
 /// `nr_groups`: number of supplementary groups
 /// `groups`: flexible array of group IDs
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct SuppGroups {
-    pub nr_groups: u32,
-    // groups: [GuestGid];
+    #[repr(C)]
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct SuppGroups {
+        pub nr_groups: u32,
+        // groups: [GuestGid];
+    }
 }
 
 unsafe impl ByteValued for SuppGroups {}
