@@ -977,18 +977,76 @@ pub trait FileSystem {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
-    /// TODO: support this
-    fn getlk(&self) -> io::Result<()> {
+    /// Test for a POSIX advisory lock on a file.
+    ///
+    /// `handle` is the `Handle` returned by the file system from the `open` method, if any.
+    /// `owner` identifies the lock owner and corresponds to the `lock_owner` passed to `flush`
+    /// and `release`. `lock` describes the byte range and lock type being queried. `flags`
+    /// contains the FUSE lock flags from the original request.
+    ///
+    /// If a conflicting lock is held by another owner, the file system should return the details
+    /// of that lock. If no conflicting lock exists, the file system should return a `FileLock`
+    /// with `type_` set to `F_UNLCK`.
+    ///
+    /// This method is only called when the file system sets `FsOptions::POSIX_LOCKS` during
+    /// `init`. If this method returns an `ENOSYS` error then the kernel will treat it as a
+    /// permanent failure and all subsequent calls to `getlk` will be handled by the kernel
+    /// without being forwarded to the file system.
+    fn getlk(
+        &self,
+        _ctx: Context,
+        _inode: Self::Inode,
+        _handle: Self::Handle,
+        _owner: u64,
+        _lock: fuse::FileLock,
+        _flags: u32,
+    ) -> io::Result<fuse::FileLock> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
-    /// TODO: support this
-    fn setlk(&self) -> io::Result<()> {
+    /// Acquire, modify, or release a POSIX advisory lock on a file.
+    ///
+    /// `handle` is the `Handle` returned by the file system from the `open` method, if any.
+    /// `owner` identifies the lock owner. `lock` describes the byte range and lock type
+    /// (`F_RDLCK`, `F_WRLCK`, or `F_UNLCK`). `flags` contains the FUSE lock flags.
+    ///
+    /// This is the non-blocking variant. If the lock cannot be acquired because a conflicting
+    /// lock is held by another owner, the file system should return an `EAGAIN` error.
+    ///
+    /// This method is only called when the file system sets `FsOptions::POSIX_LOCKS` during
+    /// `init`. If this method returns an `ENOSYS` error then the kernel will treat it as a
+    /// permanent failure and all subsequent calls to `setlk` will be handled by the kernel
+    /// without being forwarded to the file system.
+    fn setlk(
+        &self,
+        _ctx: Context,
+        _inode: Self::Inode,
+        _handle: Self::Handle,
+        _owner: u64,
+        _lock: fuse::FileLock,
+        _flags: u32,
+    ) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
-    /// TODO: support this
-    fn setlkw(&self) -> io::Result<()> {
+    /// Acquire a POSIX advisory lock, waiting if necessary.
+    ///
+    /// Like `setlk`, but the caller expects to block until the lock can be acquired. Note that
+    /// blocking inside this method will stall the virtiofsd request processing loop. True
+    /// blocking lock support requires FUSE notification queues and kernel changes that are not
+    /// yet available (see virtio-fs/virtiofsd#53).
+    ///
+    /// Implementations should perform a non-blocking attempt and return `EAGAIN` on conflict,
+    /// or use an internal retry mechanism that does not block the request loop.
+    fn setlkw(
+        &self,
+        _ctx: Context,
+        _inode: Self::Inode,
+        _handle: Self::Handle,
+        _owner: u64,
+        _lock: fuse::FileLock,
+        _flags: u32,
+    ) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
