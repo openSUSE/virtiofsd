@@ -482,6 +482,11 @@ fn parse_compat(opt: Opt) -> Opt {
             "no_posix_acl" => opt.posix_acl = false,
             "security_label" => opt.security_label = true,
             "no_security_label" => opt.security_label = false,
+            // These options are accepted for compatibility with the C virtiofsd but have
+            // no effect. The passthrough filesystem does not advertise POSIX_LOCKS or
+            // FLOCK_LOCKS, so locks are always handled locally by the guest kernel.
+            // Custom FileSystem implementations control lock support by setting the
+            // corresponding FsOptions in their init() method.
             "no_posix_lock" | "no_flock" => (),
             _ => argument_error(option),
         }

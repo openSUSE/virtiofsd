@@ -268,11 +268,17 @@ bitflags! {
         /// This feature is not currently supported.
         const SPLICE_READ = SPLICE_READ;
 
-        /// If set, then calls to `flock` will be emulated using POSIX locks and must
-        /// then be handled by the filesystem's `setlock()` handler.
+        /// If set, guest `flock()` calls are forwarded to the file system's `setlk`/`setlkw`
+        /// methods with `LK_FLOCK` set in the flags parameter. The file system is responsible
+        /// for lock arbitration.
         ///
-        /// If not set, `flock` calls will be handled by the FUSE kernel module internally (so any
-        /// access that does not go through the kernel cannot be taken into account).
+        /// If not set, `flock()` calls are handled by the kernel's local lock manager inside
+        /// the guest. This is correct for the local passthrough case (where virtiofsd calls
+        /// `flock()` on the host), but means locks are invisible to other VMs sharing the
+        /// same backing store.
+        ///
+        /// Independent of `POSIX_LOCKS` (since FUSE protocol 7.17). A file system may set
+        /// one, both, or neither.
         ///
         /// This feature is disabled by default.
         const FLOCK_LOCKS = FLOCK_LOCKS;
@@ -473,7 +479,9 @@ pub const RELEASE_FLOCK_UNLOCK: u32 = 1 << 1;
 // Getattr flags.
 pub const GETATTR_FH: u32 = 1 << 0;
 
-// Lock flags.
+// Lock flags (lk_flags field in LkIn).
+/// Set in `lk_flags` when the lock request originates from a guest `flock()` call rather than
+/// `fcntl(F_SETLK)`. Only present when `FsOptions::FLOCK_LOCKS` was set during `init`.
 pub const LK_FLOCK: u32 = 1 << 0;
 
 // Write flags.
