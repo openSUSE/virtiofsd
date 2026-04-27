@@ -334,7 +334,14 @@ impl<F: FileSystem + Sync> Server<F> {
 
         let options = FsOptions::from_bits_truncate(self.options.load(Ordering::Relaxed));
 
-        let extensions = get_extensions(options, name.len() + linkname.len(), buf.as_slice())?;
+        let extensions = match get_extensions(options, name.len() + linkname.len(), buf.as_slice())
+        {
+            Ok(extensions) => extensions,
+            Err(err) => match extension_error_to_io_error(err) {
+                Ok(io_err) => return reply_error(io_err, in_header.unique, w),
+                Err(err) => return Err(err),
+            },
+        };
 
         match self.fs.symlink(
             Context::from(in_header),
@@ -369,7 +376,13 @@ impl<F: FileSystem + Sync> Server<F> {
 
         let options = FsOptions::from_bits_truncate(self.options.load(Ordering::Relaxed));
 
-        let extensions = get_extensions(options, name.len(), buf.as_slice())?;
+        let extensions = match get_extensions(options, name.len(), buf.as_slice()) {
+            Ok(extensions) => extensions,
+            Err(err) => match extension_error_to_io_error(err) {
+                Ok(io_err) => return reply_error(io_err, in_header.unique, w),
+                Err(err) => return Err(err),
+            },
+        };
 
         match self.fs.mknod(
             Context::from(in_header),
@@ -404,7 +417,13 @@ impl<F: FileSystem + Sync> Server<F> {
 
         let options = FsOptions::from_bits_truncate(self.options.load(Ordering::Relaxed));
 
-        let extensions = get_extensions(options, name.len(), buf.as_slice())?;
+        let extensions = match get_extensions(options, name.len(), buf.as_slice()) {
+            Ok(extensions) => extensions,
+            Err(err) => match extension_error_to_io_error(err) {
+                Ok(io_err) => return reply_error(io_err, in_header.unique, w),
+                Err(err) => return Err(err),
+            },
+        };
 
         match self.fs.mkdir(
             Context::from(in_header),
@@ -1261,7 +1280,13 @@ impl<F: FileSystem + Sync> Server<F> {
 
         let options = FsOptions::from_bits_truncate(self.options.load(Ordering::Relaxed));
 
-        let extensions = get_extensions(options, name.len(), buf.as_slice())?;
+        let extensions = match get_extensions(options, name.len(), buf.as_slice()) {
+            Ok(extensions) => extensions,
+            Err(err) => match extension_error_to_io_error(err) {
+                Ok(io_err) => return reply_error(io_err, in_header.unique, w),
+                Err(err) => return Err(err),
+            },
+        };
 
         let kill_priv = open_flags & OPEN_KILL_SUIDGID != 0;
 
@@ -1720,6 +1745,14 @@ fn parse_sup_groups(data: &[u8]) -> Result<Vec<GuestGid>> {
     Ok(groups)
 }
 
+fn extension_error_to_io_error(err: Error) -> std::result::Result<io::Error, Error> {
+    match err {
+        Error::DecodeMessage(io_err) => Ok(io_err),
+        Error::InvalidHeaderLength | Error::MissingExtension => Ok(einval()),
+        other => Err(other),
+    }
+}
+
 fn get_extensions(options: FsOptions, skip: usize, request_bytes: &[u8]) -> Result<Extensions> {
     let mut extensions = Extensions::default();
 
@@ -1745,6 +1778,11 @@ fn get_extensions(options: FsOptions, skip: usize, request_bytes: &[u8]) -> Resu
         let extension_size = (extension_header.size as usize)
             .checked_sub(size_of::<ExtHeader>())
             .ok_or(Error::InvalidHeaderLength)?;
+
+        // Reject truncated extension payloads instead of panicking in split_at().
+        if extension_size > remaining_bytes.len() {
+            return Err(Error::DecodeMessage(einval()));
+        }
 
         let (current_extension_bytes, next_extension_bytes) =
             remaining_bytes.split_at(extension_size);
@@ -1785,4 +1823,60 @@ fn get_extensions(options: FsOptions, skip: usize, request_bytes: &[u8]) -> Resu
     }
 
     Ok(extensions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SUP_GROUPS_EXT_TYPE: u32 = 32;
+
+    fn build_sup_groups_request(extension_size: u32) -> (usize, Vec<u8>) {
+        let name = b"virtiofs-probe.txt\0";
+        let mut request = name.to_vec();
+        let extension_header = ExtHeader {
+            size: extension_size,
+            ext_type: SUP_GROUPS_EXT_TYPE,
+        };
+        let groups = SuppGroups { nr_groups: 1 };
+
+        request.extend_from_slice(extension_header.as_slice());
+        request.extend_from_slice(groups.as_slice());
+        request.extend_from_slice(&1000u32.to_le_bytes());
+
+        (name.len(), request)
+    }
+
+    #[test]
+    fn get_extensions_accepts_valid_sup_groups_extension() {
+        let extension_size =
+            (size_of::<ExtHeader>() + size_of::<SuppGroups>() + size_of::<u32>()) as u32;
+        let (skip, request) = build_sup_groups_request(extension_size);
+
+        let extensions = get_extensions(FsOptions::CREATE_SUPP_GROUP, skip, &request).unwrap();
+
+        assert_eq!(extensions.sup_gid, Some(1000.into()));
+        assert!(extensions.secctx.is_none());
+    }
+
+    #[test]
+    fn get_extensions_rejects_truncated_sup_groups_extension() {
+        let malformed_extension_size =
+            (size_of::<ExtHeader>() + size_of::<SuppGroups>() + (2 * size_of::<u32>())) as u32;
+        let (skip, request) = build_sup_groups_request(malformed_extension_size);
+
+        let err = get_extensions(FsOptions::CREATE_SUPP_GROUP, skip, &request).unwrap_err();
+
+        match err {
+            Error::DecodeMessage(io_err) => assert_eq!(io_err.raw_os_error(), Some(libc::EINVAL)),
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extension_error_to_io_error_maps_missing_extension_to_einval() {
+        let io_err = extension_error_to_io_error(Error::MissingExtension).unwrap();
+
+        assert_eq!(io_err.raw_os_error(), Some(libc::EINVAL));
+    }
 }
