@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: (Apache-2.0 AND BSD-3-Clause)
 
+mod used_watchdog;
+
 use std::convert::TryInto;
 use std::fs::File;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +17,7 @@ use log::*;
 use vhost::vhost_user::message::*;
 use vhost::vhost_user::Backend;
 use vhost_user_backend::bitmap::BitmapMmapRegion;
-use vhost_user_backend::{VhostUserBackend, VringMutex, VringState, VringT};
+use vhost_user_backend::{VhostUserBackend, VringMutex, VringT};
 use virtio_bindings::bindings::virtio_config::*;
 use virtio_bindings::bindings::virtio_ring::{
     VIRTIO_RING_F_EVENT_IDX, VIRTIO_RING_F_INDIRECT_DESC,
@@ -34,6 +36,7 @@ use crate::filesystem::{FileSystem, SerializableFileSystem};
 use crate::server::Server;
 use crate::util::other_io_error;
 use crate::Error as VhostUserFsError;
+use used_watchdog::{DescriptorGuard, UsedVringWatchdog, UsedVringWatchdogLeash, VringDeref};
 
 type LoggedMemory = GuestMemoryMmap<BitmapMmapRegion>;
 type LoggedMemoryAtomic = GuestMemoryAtomic<LoggedMemory>;
@@ -121,6 +124,9 @@ struct VhostUserFsThread<F: FileSystem + Send + Sync + 'static> {
     vu_req: Option<Backend>,
     event_idx: bool,
     pool: Option<ThreadPool>,
+
+    /// Watchdog to check the guest processing the used vring.
+    used_watchdog: Arc<UsedVringWatchdog>,
 }
 
 impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFsThread<F> {
@@ -158,11 +164,12 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
             vu_req: None,
             event_idx: false,
             pool,
+            used_watchdog: Arc::new(UsedVringWatchdog::new()),
         })
     }
 
     fn return_descriptor(
-        vring_state: &mut VringState<LoggedMemoryAtomic>,
+        mut desc_guard: DescriptorGuard<'_, '_>,
         head_index: u16,
         event_idx: bool,
         len: usize,
@@ -171,6 +178,8 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
             Ok(l) => l,
             Err(_) => panic!("Invalid used length, can't return used descritors to the ring"),
         };
+
+        let mut vring_state = desc_guard.vring_state();
 
         if vring_state.add_used(head_index, used_len).is_err() {
             warn!("Couldn't return used descriptors to the ring");
@@ -193,15 +202,20 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
         }
     }
 
-    fn process_queue_pool(&self, vring: VringMutex<LoggedMemoryAtomic>) -> Result<bool> {
+    fn process_queue_pool(
+        &self,
+        vring_watchdog: &Arc<
+            used_watchdog::UsedVringWatchdogLeash<'static, Arc<UsedVringWatchdog>>,
+        >,
+    ) -> Result<bool> {
         let mut used_any = false;
         let atomic_mem = match &self.mem {
             Some(m) => m,
             None => return Err(Error::NoMemoryConfigured),
         };
 
-        while let Some(avail_desc) = vring
-            .get_mut()
+        while let Some(avail_desc) = vring_watchdog
+            .lock_vring_state()
             .get_queue_mut()
             .iter(atomic_mem.memory())
             .map_err(|_| Error::IterateQueue)?
@@ -214,8 +228,8 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
             let server = self.server.clone();
             let mut vu_req = self.vu_req.clone();
             let event_idx = self.event_idx;
-            let worker_vring = vring.clone();
             let worker_desc = avail_desc.clone();
+            let desc_watchdog_guard = Arc::clone(vring_watchdog).guard_descriptor_owned();
 
             self.pool.as_ref().unwrap().spawn_ok(async move {
                 let mem = atomic_mem.memory();
@@ -233,16 +247,16 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
                     .map_err(Error::ProcessQueue)
                     .unwrap();
 
-                Self::return_descriptor(&mut worker_vring.get_mut(), head_index, event_idx, len);
+                Self::return_descriptor(desc_watchdog_guard, head_index, event_idx, len);
             });
         }
 
         Ok(used_any)
     }
 
-    fn process_queue_serial(
+    fn process_queue_serial<'a>(
         &self,
-        vring_state: &mut VringState<LoggedMemoryAtomic>,
+        vring_watchdog: &mut UsedVringWatchdogLeash<'a, &'a UsedVringWatchdog>,
     ) -> Result<bool> {
         let mut used_any = false;
         let mem = match &self.mem {
@@ -251,7 +265,8 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
         };
         let mut vu_req = self.vu_req.clone();
 
-        let avail_chains: Vec<DescriptorChain<GuestMemoryLoadGuard<LoggedMemory>>> = vring_state
+        let avail_chains: Vec<DescriptorChain<GuestMemoryLoadGuard<LoggedMemory>>> = vring_watchdog
+            .vring_state()
             .get_queue_mut()
             .iter(mem.clone())
             .map_err(|_| Error::IterateQueue)?
@@ -259,6 +274,8 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
 
         for chain in avail_chains {
             used_any = true;
+
+            let desc_watchdog_guard = vring_watchdog.guard_descriptor_by_ref();
 
             let head_index = chain.head_index();
 
@@ -275,7 +292,7 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
                 .map_err(Error::ProcessQueue)
                 .unwrap();
 
-            Self::return_descriptor(vring_state, head_index, self.event_idx, len);
+            Self::return_descriptor(desc_watchdog_guard, head_index, self.event_idx, len);
         }
 
         Ok(used_any)
@@ -298,6 +315,18 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
             _ => return Err(Error::HandleEventUnknownEvent.into()),
         };
 
+        let Some(mem) = self.mem.as_ref().cloned() else {
+            return Err(Error::NoMemoryConfigured.into());
+        };
+
+        let vring_watchdog = Arc::new(
+            Arc::clone(&self.used_watchdog).begin_virtqueue_polling_owned(
+                mem,
+                idx,
+                vrings[idx].clone(),
+            ),
+        );
+
         if self.event_idx {
             // vm-virtio's Queue implementation only checks avail_index
             // once, so to properly support EVENT_IDX we need to keep
@@ -306,7 +335,7 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
             loop {
                 vrings[idx].disable_notification().unwrap();
                 // we can't recover from an error here, so let's hope it's transient
-                if let Err(e) = self.process_queue_pool(vrings[idx].clone()) {
+                if let Err(e) = self.process_queue_pool(&vring_watchdog) {
                     error!("processing the vring {idx}: {e}");
                 }
                 if !vrings[idx].enable_notification().unwrap() {
@@ -315,7 +344,7 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
             }
         } else {
             // Without EVENT_IDX, a single call is enough.
-            self.process_queue_pool(vrings[idx].clone())?;
+            self.process_queue_pool(&vring_watchdog)?;
         }
 
         Ok(())
@@ -326,17 +355,29 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
         device_event: u16,
         vrings: &[VringMutex<LoggedMemoryAtomic>],
     ) -> io::Result<()> {
-        let mut vring_state = match device_event {
+        let idx = match device_event {
             HIPRIO_QUEUE_EVENT => {
                 debug!("HIPRIO_QUEUE_EVENT");
-                vrings[0].get_mut()
+                0
             }
             REQ_QUEUE_EVENT => {
                 debug!("QUEUE_EVENT");
-                vrings[1].get_mut()
+                1
             }
             _ => return Err(Error::HandleEventUnknownEvent.into()),
         };
+        let mut vring_state = vrings[idx].get_mut();
+
+        let Some(mem) = self.mem.as_ref().cloned() else {
+            return Err(Error::NoMemoryConfigured.into());
+        };
+
+        let mut vring_watchdog = self.used_watchdog.begin_virtqueue_polling_by_ref(
+            mem,
+            idx,
+            &mut vring_state,
+            vrings[idx].clone(),
+        );
 
         if self.event_idx {
             // vm-virtio's Queue implementation only checks avail_index
@@ -344,18 +385,18 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
             // calling process_queue() until it stops finding new
             // requests on the queue.
             loop {
-                vring_state.disable_notification().unwrap();
+                vring_watchdog.vring_state().disable_notification().unwrap();
                 // we can't recover from an error here, so let's hope it's transient
-                if let Err(e) = self.process_queue_serial(&mut vring_state) {
+                if let Err(e) = self.process_queue_serial(&mut vring_watchdog) {
                     error!("processing the vring: {e}");
                 }
-                if !vring_state.enable_notification().unwrap() {
+                if !vring_watchdog.vring_state().enable_notification().unwrap() {
                     break;
                 }
             }
         } else {
             // Without EVENT_IDX, a single call is enough.
-            self.process_queue_serial(&mut vring_state)?;
+            self.process_queue_serial(&mut vring_watchdog)?;
         }
 
         Ok(())
