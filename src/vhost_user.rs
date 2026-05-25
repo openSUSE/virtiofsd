@@ -13,7 +13,6 @@ use std::thread::{self, JoinHandle};
 use std::{convert, error, fmt, io};
 
 use futures::executor::{ThreadPool, ThreadPoolBuilder};
-use libc::EFD_NONBLOCK;
 use log::*;
 
 #[cfg(feature = "iouring")]
@@ -31,7 +30,9 @@ use vm_memory::{
     ByteValued, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryLoadGuard, GuestMemoryMmap, Le32,
 };
 use vmm_sys_util::epoll::EventSet;
-use vmm_sys_util::eventfd::EventFd;
+use vmm_sys_util::event::{
+    new_event_consumer_and_notifier, EventConsumer, EventFlag, EventNotifier,
+};
 
 #[cfg(feature = "iouring")]
 use crate::async_wrappers::IoUringRuntimeWithEventFd;
@@ -126,7 +127,6 @@ impl convert::From<Error> for io::Error {
 
 struct VhostUserFsThread<F: FileSystem + Send + Sync + 'static> {
     mem: Option<LoggedMemoryAtomic>,
-    kill_evt: EventFd,
     server: Arc<Server<F>>,
     // handle request from backend to frontend
     vu_req: Option<Backend>,
@@ -198,7 +198,6 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
 
         Ok(VhostUserFsThread {
             mem: None,
-            kill_evt: EventFd::new(EFD_NONBLOCK).map_err(Error::CreateKillEventFd)?,
             server: Arc::new(Server::new(fs)),
             vu_req: None,
             event_idx: false,
@@ -657,8 +656,11 @@ where
         }
     }
 
-    fn exit_event(&self, _thread_index: usize) -> Option<EventFd> {
-        Some(self.thread.read().unwrap().kill_evt.try_clone().unwrap())
+    fn exit_event(&self, _thread_index: usize) -> Option<(EventConsumer, EventNotifier)> {
+        Some(
+            new_event_consumer_and_notifier(EventFlag::NONBLOCK)
+                .expect("Failed to create exit notifier"),
+        )
     }
 
     fn set_backend_req_fd(&self, vu_req: Backend) {
@@ -776,21 +778,5 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
         migration_thread
             .join()
             .map_err(|_| other_io_error("Failed to join the migration thread"))?
-    }
-}
-
-impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> Drop
-    for VhostUserFsBackend<F>
-{
-    fn drop(&mut self) {
-        let result = self
-            .thread
-            .read()
-            .unwrap_or_else(|err| err.into_inner())
-            .kill_evt
-            .write(1);
-        if let Err(e) = result {
-            error!("Error shutting down worker thread: {e:?}")
-        }
     }
 }

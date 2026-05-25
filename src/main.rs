@@ -821,9 +821,10 @@ fn main() {
         opt.sandbox,
         opt.uid_map,
         opt.gid_map,
-    )
-    .unwrap_or_else(|error| {
-        error!("Error creating sandbox: {error}");
+    );
+
+    let mountinfo_prefix = sandbox.get_mountinfo_prefix().unwrap_or_else(|error| {
+        error!("Error getting mountinfo prefix: {error}");
         process::exit(1)
     });
 
@@ -839,7 +840,7 @@ fn main() {
         attr_timeout: timeout,
         cache_policy: opt.cache,
         root_dir: sandbox.get_root_dir(),
-        mountinfo_prefix: sandbox.get_mountinfo_prefix(),
+        mountinfo_prefix,
         xattr,
         xattrmap,
         proc_sfd_rawfd: sandbox.get_proc_self_fd(),
@@ -937,7 +938,7 @@ fn main() {
 // Use a generic function for the main loop so we don't need to use Box<dyn FileSystem>
 fn run_generic_fs<F: FileSystem + SerializableFileSystem + Send + Sync + 'static>(
     fs: F,
-    listener: Listener,
+    mut listener: Listener,
     thread_pool_size: usize,
     tag: Option<String>,
     #[cfg(feature = "iouring")] io_uring_runtime: Option<IoUringRuntimeWithEventFd>,
@@ -976,7 +977,7 @@ fn run_generic_fs<F: FileSystem + SerializableFileSystem + Send + Sync + 'static
 
     info!("Waiting for vhost-user socket connection...");
 
-    if let Err(e) = daemon.start(listener) {
+    if let Err(e) = daemon.start(&mut listener) {
         error!("Failed to start daemon: {e:?}");
         process::exit(1);
     }
