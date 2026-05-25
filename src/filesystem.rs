@@ -2,6 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#[cfg(feature = "iouring")]
+pub mod filesystem_async;
+
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::sync::atomic::AtomicBool;
@@ -9,6 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{io, mem};
 
+#[cfg(feature = "iouring")]
+use crate::filesystem::filesystem_async::{AsyncZeroCopyReader, AsyncZeroCopyWriter};
 use crate::soft_idmap::{GuestGid, GuestUid};
 use crate::{fuse, oslib};
 
@@ -227,6 +232,7 @@ pub trait DirectoryIterator {
 }
 
 /// The main trait that connects a file system with a transport.
+#[cfg_attr(feature = "iouring", async_trait::async_trait)]
 #[allow(unused_variables)]
 pub trait FileSystem {
     /// Represents a location in the filesystem tree and can be used to perform operations that act
@@ -251,14 +257,14 @@ pub trait FileSystem {
     ///
     /// Note that if a file system will be exported over NFS the `Inode`'s lifetime must extend even
     /// beyond `forget`. See the `generation` field in `Entry`.
-    type Inode: From<u64> + Into<u64>;
+    type Inode: From<u64> + Into<u64> + Send;
 
     /// Represents a file or directory that is open for reading/writing.
-    type Handle: From<u64> + Into<u64>;
+    type Handle: From<u64> + Into<u64> + Send;
 
     /// An iterator over the entries of a directory. See the documentation for `readdir` for more
     /// details.
-    type DirIter: DirectoryIterator;
+    type DirIter: DirectoryIterator + Send;
 
     /// Initialize the file system.
     ///
@@ -465,6 +471,19 @@ pub trait FileSystem {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
+    #[cfg(feature = "iouring")]
+    async fn rename_async(
+        &self,
+        ctx: Context,
+        olddir: Self::Inode,
+        oldname: &CStr,
+        newdir: Self::Inode,
+        newname: &CStr,
+        flags: u32,
+    ) -> io::Result<()> {
+        self.rename(ctx, olddir, oldname, newdir, newname, flags)
+    }
+
     /// Create a hard link.
     ///
     /// Create a hard link from `inode` to `newname` in the directory represented by `newparent`.
@@ -567,6 +586,23 @@ pub trait FileSystem {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
+    /// Asynchronous variant of [`FileSystem::create`].
+    #[cfg(feature = "iouring")]
+    #[allow(clippy::too_many_arguments)]
+    async fn create_async(
+        &self,
+        ctx: Context,
+        parent: Self::Inode,
+        name: &CStr,
+        mode: u32,
+        kill_priv: bool,
+        flags: u32,
+        umask: u32,
+        extensions: Extensions,
+    ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions)> {
+        self.create(ctx, parent, name, mode, kill_priv, flags, umask, extensions)
+    }
+
     /// Read data from a file.
     ///
     /// Returns `size` bytes of data starting from offset `off` from the file associated with
@@ -595,6 +631,23 @@ pub trait FileSystem {
         flags: u32,
     ) -> io::Result<usize> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+
+    /// Asynchronous variant of [`FileSystem::read`].
+    #[cfg(feature = "iouring")]
+    #[allow(clippy::too_many_arguments)]
+    async fn read_async<W: AsyncZeroCopyWriter + Send>(
+        &self,
+        ctx: Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        w: W,
+        size: u32,
+        offset: u64,
+        lock_owner: Option<u64>,
+        flags: u32,
+    ) -> io::Result<usize> {
+        self.read(ctx, inode, handle, w, size, offset, lock_owner, flags)
     }
 
     /// Write data to a file.
@@ -631,6 +684,36 @@ pub trait FileSystem {
         flags: u32,
     ) -> io::Result<usize> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+
+    /// Asynchronous variant of [`FileSystem::write`].
+    #[cfg(feature = "iouring")]
+    #[allow(clippy::too_many_arguments)]
+    async fn write_async<R: AsyncZeroCopyReader + Send>(
+        &self,
+        ctx: Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        r: R,
+        size: u32,
+        offset: u64,
+        lock_owner: Option<u64>,
+        delayed_write: bool,
+        kill_priv: bool,
+        flags: u32,
+    ) -> io::Result<usize> {
+        self.write(
+            ctx,
+            inode,
+            handle,
+            r,
+            size,
+            offset,
+            lock_owner,
+            delayed_write,
+            kill_priv,
+            flags,
+        )
     }
 
     /// Flush the contents of a file.

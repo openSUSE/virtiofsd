@@ -2,21 +2,32 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#[cfg(feature = "iouring")]
+pub mod asyncs;
 pub mod credentials;
 pub mod device_state;
 pub mod file_handle;
 mod guest_fd_limit;
 pub mod inode_store;
 pub mod mount_fd;
+#[cfg(feature = "iouring")]
+pub mod personality_store;
 pub mod read_only;
+pub mod smol_wrapper;
 pub mod stat;
 pub mod util;
 pub mod xattrmap;
 
+#[cfg(feature = "iouring")]
+use crate::async_wrappers::{IoUringRuntime, IoUringRuntimeWithEventFd, IoUringState};
+#[cfg(feature = "iouring")]
+use crate::filesystem::filesystem_async::{AsyncZeroCopyReader, AsyncZeroCopyWriter};
 use crate::filesystem::{
     Context, Entry, Extensions, FileSystem, FsOptions, GetxattrReply, ListxattrReply, OpenOptions,
     SecContext, SetattrValid, SetxattrFlags, ZeroCopyReader, ZeroCopyWriter,
 };
+#[cfg(feature = "iouring")]
+use crate::passthrough::asyncs::io_uring::IoUringAwait;
 use crate::passthrough::credentials::{drop_effective_cap, UnixCredentials, UnixCredentialsGuard};
 use crate::passthrough::device_state::preserialization::{
     self, HandleMigrationInfo, InodeMigrationInfo,
@@ -24,6 +35,9 @@ use crate::passthrough::device_state::preserialization::{
 use crate::passthrough::inode_store::{
     Inode, InodeData, InodeFile, InodeIds, InodeStore, StrongInodeReference,
 };
+#[cfg(feature = "iouring")]
+use crate::passthrough::personality_store::PersonalityStore;
+use crate::passthrough::smol_wrapper::SmolRwLock;
 use crate::passthrough::util::{
     ebadf, is_safe_inode, openat, openat_verbose, reopen_fd_through_proc,
 };
@@ -31,8 +45,13 @@ use crate::read_dir::ReadDir;
 use crate::soft_idmap::{self, GuestGid, GuestUid, HostGid, HostUid, Id, IdMap};
 use crate::util::{other_io_error, ResultErrorContext};
 use crate::{fuse, oslib};
+use async_generic::async_generic;
 use file_handle::{FileHandle, FileOrHandle, OpenableFileHandle};
 use guest_fd_limit::{GuestFdSemaphore, GuestFile};
+#[cfg(feature = "iouring")]
+use io_uring::opcode;
+#[cfg(feature = "iouring")]
+use io_uring::types::Fd;
 use mount_fd::{MPRError, MountFds};
 pub(crate) use stat::{statx, StatExt};
 use std::borrow::Cow;
@@ -43,6 +62,7 @@ use std::fs::File;
 use std::io;
 use std::io::ErrorKind;
 use std::mem::MaybeUninit;
+use std::os::fd::{IntoRawFd, OwnedFd};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -66,7 +86,7 @@ fn should_clear_sgid_for_setxattr(
 }
 
 enum HandleDataFile {
-    File(RwLock<GuestFile>),
+    File(SmolRwLock<GuestFile>),
     // `io::Error` does not implement `Clone`, so without wrapping it in `Arc`, returning the error
     // anywhere would be impossible without consuming it
     Invalid(Arc<io::Error>),
@@ -401,6 +421,10 @@ pub struct Config {
     ///
     /// The default is `u64::MAX`.
     pub guest_fd_limit: u64,
+
+    /// Whether to use asynchronous I/O via io_uring.
+    #[cfg(feature = "iouring")]
+    pub use_io_uring: bool,
 }
 
 impl Default for Config {
@@ -433,6 +457,8 @@ impl Default for Config {
             uid_map: None,
             gid_map: None,
             guest_fd_limit: u64::MAX,
+            #[cfg(feature = "iouring")]
+            use_io_uring: false,
         }
     }
 }
@@ -502,10 +528,25 @@ pub struct PassthroughFs {
 
     /// Map to translate between host and guest GIDs.
     gid_map: IdMap<GuestGid, HostGid>,
+
+    /// io_uring runtime
+    #[cfg(feature = "iouring")]
+    io_uring_runtime: Option<IoUringRuntime>,
+
+    /// io_uring personality IDs.
+    #[cfg(feature = "iouring")]
+    personality_store: PersonalityStore,
+
+    /// The probe of the io_uring instance. `probe` is `None` if we failed to perform probe.
+    #[cfg(feature = "iouring")]
+    probe: Option<io_uring::Probe>,
 }
 
 impl PassthroughFs {
-    pub fn new(mut cfg: Config) -> io::Result<PassthroughFs> {
+    pub fn new(
+        mut cfg: Config,
+        #[cfg(feature = "iouring")] io_uring_runtime: Option<&IoUringRuntimeWithEventFd>,
+    ) -> io::Result<PassthroughFs> {
         let proc_self_fd = if let Some(fd) = cfg.proc_sfd_rawfd.take() {
             fd
         } else {
@@ -551,6 +592,29 @@ impl PassthroughFs {
             IdMap::empty()
         };
 
+        #[cfg(feature = "iouring")]
+        let (io_uring_runtime, io_uring_eventfd, probe) = if let Some(r) = io_uring_runtime {
+            let runtime = r.runtime().clone();
+            let mut probe = io_uring::Probe::new();
+            let probe = match runtime
+                .state
+                .lock()
+                .expect("Lock poisoned: another thread must have panicked")
+                .ring
+                .submitter()
+                .register_probe(&mut probe)
+            {
+                Ok(_) => Some(probe),
+                Err(_) => {
+                    // In case of error, we assume kernel does not support `IORING_REGISTER_PROBE`.
+                    log::warn!("Failed to register io_uring probe, assuming kernel does not support IORING_REGISTER_PROBE, and virtiofsd will skip io_uring opcode availability checks.");
+                    None
+                }
+            };
+            (Some(runtime), Some(r.event_fd()), probe)
+        } else {
+            (None, None, None)
+        };
         let mut fs = PassthroughFs {
             inodes: Default::default(),
             next_inode: AtomicU64::new(fuse::ROOT_ID + 1),
@@ -569,6 +633,12 @@ impl PassthroughFs {
             cfg,
             uid_map,
             gid_map,
+            #[cfg(feature = "iouring")]
+            io_uring_runtime,
+            #[cfg(feature = "iouring")]
+            personality_store: PersonalityStore::new(),
+            #[cfg(feature = "iouring")]
+            probe,
         };
 
         // Check to see if the client remapped "security.capability", if so,
@@ -587,11 +657,38 @@ impl PassthroughFs {
         // able to set all the bits in the mode.
         oslib::umask(0o000);
 
+        #[cfg(feature = "iouring")]
+        if let Some(eventfd) = io_uring_eventfd {
+            // Register the eventfd with io_uring if we are using it.
+            fs.register_io_uring_fd(eventfd.as_raw_fd())
+                .err_context(|| "Failed to register eventfd with io_uring")?;
+        }
+
         Ok(fs)
     }
 
     fn switch_to_proc_self_fd(&self) -> ScopedWorkingDirectory {
         ScopedWorkingDirectory::new(self.proc_self_fd.as_raw_fd(), self.orig_wd_fd.as_raw_fd())
+    }
+
+    /// Returns true if the given io_uring opcode is supported by the kernel, according to the probe.
+    /// If we have failed to perform probe, we optimistically assume all opcodes are supported.
+    #[cfg(feature = "iouring")]
+    pub fn is_io_uring_op_supported(&self, opcode: u8) -> bool {
+        self.probe.as_ref().is_none_or(|p| p.is_supported(opcode))
+    }
+
+    #[cfg(feature = "iouring")]
+    fn register_io_uring_fd(&self, fd: RawFd) -> io::Result<()> {
+        self.io_uring_runtime
+            .as_ref()
+            .expect("io_uring runtime should be set")
+            .state
+            .lock()
+            .expect("Lock poisoned: another thread must have panicked")
+            .ring
+            .submitter()
+            .register_eventfd(fd)
     }
 
     pub fn keep_fds(&self) -> Vec<RawFd> {
@@ -622,6 +719,11 @@ impl PassthroughFs {
             .filter(|hd| hd.inode == inode)
             .cloned()
             .ok_or_else(ebadf)
+    }
+
+    #[cfg(feature = "iouring")]
+    fn io_uring(&self) -> Option<&Arc<Mutex<IoUringState>>> {
+        self.io_uring_runtime.as_ref().map(|runtime| &runtime.state)
     }
 
     fn open_inode(&self, inode: Inode, mut flags: i32) -> io::Result<File> {
@@ -1157,33 +1259,196 @@ impl PassthroughFs {
         }
     }
 
+    #[cfg_attr(not(feature = "iouring"), allow(unreachable_code))]
+    #[cfg_attr(not(feature = "iouring"), allow(unused_variables))]
+    #[async_generic]
+    #[allow(clippy::too_many_arguments)]
+    fn create_inner(
+        &self,
+        ctx: Context,
+        parent: Inode,
+        name: &CStr,
+        mode: u32,
+        kill_priv: bool,
+        flags: u32,
+        umask: u32,
+        extensions: Extensions,
+    ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
+        let data = self.inodes.get(parent).ok_or_else(ebadf)?;
+        let parent_file = data.get_file()?;
+
+        // We need to clean the `O_APPEND` flag in case the file is mem mapped or if the flag
+        // is later modified in the guest using `fcntl(F_SETFL)`. We do a per-write `O_APPEND`
+        // check setting `RWF_APPEND` for non-mmapped writes, if necessary.
+        let create_flags = flags & !(libc::O_APPEND as u32);
+        let fd: io::Result<RawFd>;
+        if _sync {
+            fd = self.do_create(
+                &ctx,
+                &parent_file,
+                name,
+                mode,
+                create_flags,
+                umask,
+                extensions,
+            );
+        } else {
+            #[cfg(feature = "iouring")]
+            {
+                fd = self
+                    .do_create_async(
+                        &ctx,
+                        &parent_file,
+                        name,
+                        mode,
+                        create_flags,
+                        umask,
+                        extensions,
+                    )
+                    .await;
+            }
+            #[cfg(not(feature = "iouring"))]
+            {
+                unreachable!("async create requires the iouring feature");
+            }
+        }
+
+        let (entry, handle) = match fd {
+            Err(last_error) => {
+                // Ignore the error if the file exists and O_EXCL is not present in `flags`
+                match last_error.kind() {
+                    io::ErrorKind::AlreadyExists => {
+                        if (flags as i32 & libc::O_EXCL) != 0 {
+                            return Err(last_error);
+                        }
+                    }
+                    _ => return Err(last_error),
+                }
+
+                let entry = self.do_lookup(parent, name)?;
+                let (handle, _) = self.do_open(entry.inode, kill_priv, flags)?;
+                let handle = handle.ok_or_else(ebadf)?;
+
+                (entry, handle)
+            }
+            Ok(fd) => {
+                // Safe because we just opened this fd.
+                let file = unsafe { File::from_raw_fd(fd) };
+
+                let entry = self.do_lookup(parent, name)?;
+
+                let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+                let data = HandleData {
+                    inode: entry.inode,
+                    file: self.guest_fds.allocate(file)?.into(),
+                    migration_info: HandleMigrationInfo::new(flags as i32),
+                };
+
+                self.handles.write().unwrap().insert(handle, Arc::new(data));
+
+                (entry, handle)
+            }
+        };
+
+        let mut opts = OpenOptions::empty();
+        match self.cfg.cache_policy {
+            CachePolicy::Never => opts |= OpenOptions::DIRECT_IO,
+            CachePolicy::Metadata => opts |= OpenOptions::DIRECT_IO,
+            CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
+            _ => {}
+        };
+
+        Ok((entry, Some(handle), opts))
+    }
+
+    #[cfg_attr(not(feature = "iouring"), allow(unreachable_code))]
+    #[cfg_attr(not(feature = "iouring"), allow(unused_variables))]
+    #[async_generic]
     #[allow(clippy::too_many_arguments)]
     fn do_create(
         &self,
         ctx: &Context,
-        parent_file: &InodeFile,
+        parent_file: &InodeFile<'_>,
         name: &CStr,
         mode: u32,
         flags: u32,
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<RawFd> {
-        let fd = {
-            let _credentials_guard = self.unix_credentials_guard(ctx, &extensions)?;
-            let _umask_guard = self
-                .posix_acl
-                .load(Ordering::Relaxed)
-                .then(|| oslib::ScopedUmask::new(umask));
+        let fd: RawFd;
+        if _sync {
+            fd = {
+                let _credentials_guard = self.unix_credentials_guard(ctx, &extensions)?;
+                let _umask_guard = self
+                    .posix_acl
+                    .load(Ordering::Relaxed)
+                    .then(|| oslib::ScopedUmask::new(umask));
 
-            // Add libc:O_EXCL to ensure we're not accidentally opening a file the guest wouldn't
-            // be allowed to access otherwise.
-            self.open_relative_to(
-                parent_file,
-                name,
-                flags as i32 | libc::O_CREAT | libc::O_EXCL,
-                mode.into(),
-            )?
-        };
+                // Add libc:O_EXCL to ensure we're not accidentally opening a file the guest wouldn't
+                // be allowed to access otherwise.
+                self.open_relative_to(
+                    parent_file,
+                    name,
+                    flags as i32 | libc::O_CREAT | libc::O_EXCL,
+                    mode.into(),
+                )?
+            };
+        } else {
+            #[cfg(feature = "iouring")]
+            {
+                use io_uring::types::OpenHow;
+
+                let ring = self.io_uring().unwrap();
+
+                let id = self.personality_store.get_or_register_personality_id(
+                    self,
+                    ring,
+                    ctx,
+                    &extensions,
+                    umask,
+                )?;
+
+                // `openat2(2)` returns an error if `how.mode` contains bits other than those in range 07777,
+                // let's ignore the extra bits to be compatible with `openat(2)`.
+                let mode = u64::from(mode) & 0o7777;
+
+                // Add libc:O_EXCL to ensure we're not accidentally opening a file the guest wouldn't
+                // be allowed to access otherwise.
+                let flags = libc::O_CREAT
+                    | libc::O_EXCL
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC
+                    | (flags as i32);
+                let how = OpenHow::new()
+                    .resolve(libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_MAGICLINKS)
+                    .flags(flags as u64)
+                    .mode(mode);
+
+                let e = opcode::OpenAt2::new(
+                    Fd(parent_file.as_raw_fd()),
+                    name.as_ptr(),
+                    &how as *const _,
+                )
+                .build()
+                .personality(id);
+
+                // SAFETY: `pathname` points to a valid NUL-terminated string, and the `how` pointer is a valid
+                // pointer to an `open_how` struct. `parent_file` is a valid file descriptor
+                // during the `IoUringAwait`'s lifetime since we `await`s the created Future.
+                let res = unsafe { IoUringAwait::op(ring, e) }.await;
+                if res < 0 {
+                    return Err(io::Error::from_raw_os_error(-res));
+                }
+                fd = RawFd::from(res);
+            }
+            #[cfg(not(feature = "iouring"))]
+            {
+                unreachable!("async create requires the iouring feature");
+            }
+        }
+        // Safety: This is safe because we just obtained this fd in this function,
+        // and we already checked for errors.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
 
         // Set security context
         if let Some(secctx) = extensions.secctx {
@@ -1200,7 +1465,7 @@ impl PassthroughFs {
 
             let ret = unsafe {
                 libc::fsetxattr(
-                    fd,
+                    fd.as_raw_fd(),
                     xattr_name.as_ptr(),
                     secctx.secctx.as_ptr() as *const libc::c_void,
                     secctx.secctx.len(),
@@ -1215,7 +1480,89 @@ impl PassthroughFs {
                 return Err(io::Error::last_os_error());
             }
         }
-        Ok(fd)
+        Ok(fd.into_raw_fd())
+    }
+
+    #[cfg_attr(not(feature = "iouring"), allow(unreachable_code))]
+    #[cfg_attr(not(feature = "iouring"), allow(unused_variables))]
+    #[async_generic]
+    fn do_rename(
+        &self,
+        _ctx: Context,
+        olddir: Inode,
+        oldname: &CStr,
+        newdir: Inode,
+        newname: &CStr,
+        flags: u32,
+    ) -> io::Result<()> {
+        let old_inode = self.inodes.get(olddir).ok_or_else(ebadf)?;
+        let new_inode = self.inodes.get(newdir).ok_or_else(ebadf)?;
+
+        let old_file = old_inode.get_file()?;
+        let new_file = new_inode.get_file()?;
+
+        let invalidated_inode = self.before_invalidating_path(&new_inode, newname);
+
+        let err: Option<io::Error>;
+        if _sync {
+            // Safe because this doesn't modify any memory and we check the return value.
+            // TODO: Switch to libc::renameat2 once https://github.com/rust-lang/libc/pull/1508 lands
+            // and we have glibc 2.28.
+            let res = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    old_file.as_raw_fd(),
+                    oldname.as_ptr(),
+                    new_file.as_raw_fd(),
+                    newname.as_ptr(),
+                    flags,
+                )
+            };
+            if res != 0 {
+                err = Some(io::Error::last_os_error());
+            } else {
+                err = None;
+            }
+        } else {
+            #[cfg(feature = "iouring")]
+            {
+                let e = opcode::RenameAt::new(
+                    Fd(old_file.as_raw_fd()),
+                    oldname.as_ptr(),
+                    Fd(new_file.as_raw_fd()),
+                    newname.as_ptr(),
+                )
+                .flags(flags)
+                .build();
+
+                // Safety: Safe because e is properly initialized and the created future is awaited.
+                let res = unsafe { IoUringAwait::op(self.io_uring().unwrap(), e) }.await;
+                if res != 0 {
+                    err = Some(io::Error::from_raw_os_error(-res));
+                } else {
+                    err = None;
+                }
+            }
+            #[cfg(not(feature = "iouring"))]
+            {
+                unreachable!("async rename requires the iouring feature");
+            }
+        }
+        if let Some(invalidated_inode) = invalidated_inode {
+            self.after_invalidating_path(invalidated_inode, "Overwrote (via rename)");
+        }
+        if let Some(e) = err {
+            return Err(e);
+        }
+
+        if let Err(err) = self.update_inode_migration_info(new_inode, newname) {
+            warn!(
+                "Failed to update renamed file's ({oldname:?} -> {newname:?}) migration info, \
+                the migration destination may be unable to find it: {err}",
+            );
+        }
+
+        Ok(())
     }
 
     fn do_mknod_mkdir_symlink_secctx(
@@ -1510,6 +1857,7 @@ impl PassthroughFs {
     }
 }
 
+#[cfg_attr(feature = "iouring", async_trait::async_trait)]
 impl FileSystem for PassthroughFs {
     type Inode = Inode;
     type Handle = Handle;
@@ -1704,7 +2052,7 @@ impl FileSystem for PassthroughFs {
         // lock for both the `lseek64` and `getdents64` syscalls to ensure that no other
         // thread changes the kernel offset while we are using it.
         #[allow(clippy::readonly_write_lock)]
-        let dir = data.file.get()?.write().unwrap();
+        let dir = data.file.get()?.write_blocking();
 
         ReadDir::new(&*dir, offset as libc::off64_t, buf)
     }
@@ -1743,69 +2091,27 @@ impl FileSystem for PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
-        let data = self.inodes.get(parent).ok_or_else(ebadf)?;
-        let parent_file = data.get_file()?;
+        self.create_inner(ctx, parent, name, mode, kill_priv, flags, umask, extensions)
+    }
 
-        // We need to clean the `O_APPEND` flag in case the file is mem mapped or if the flag
-        // is later modified in the guest using `fcntl(F_SETFL)`. We do a per-write `O_APPEND`
-        // check setting `RWF_APPEND` for non-mmapped writes, if necessary.
-        let create_flags = flags & !(libc::O_APPEND as u32);
-        let fd = self.do_create(
-            &ctx,
-            &parent_file,
-            name,
-            mode,
-            create_flags,
-            umask,
-            extensions,
-        );
-
-        let (entry, handle) = match fd {
-            Err(last_error) => {
-                // Ignore the error if the file exists and O_EXCL is not present in `flags`
-                match last_error.kind() {
-                    io::ErrorKind::AlreadyExists => {
-                        if (flags as i32 & libc::O_EXCL) != 0 {
-                            return Err(last_error);
-                        }
-                    }
-                    _ => return Err(last_error),
-                }
-
-                let entry = self.do_lookup(parent, name)?;
-                let (handle, _) = self.do_open(entry.inode, kill_priv, flags)?;
-                let handle = handle.ok_or_else(ebadf)?;
-
-                (entry, handle)
-            }
-            Ok(fd) => {
-                // Safe because we just opened this fd.
-                let file = unsafe { File::from_raw_fd(fd) };
-
-                let entry = self.do_lookup(parent, name)?;
-
-                let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-                let data = HandleData {
-                    inode: entry.inode,
-                    file: self.guest_fds.allocate(file)?.into(),
-                    migration_info: HandleMigrationInfo::new(flags as i32),
-                };
-
-                self.handles.write().unwrap().insert(handle, Arc::new(data));
-
-                (entry, handle)
-            }
-        };
-
-        let mut opts = OpenOptions::empty();
-        match self.cfg.cache_policy {
-            CachePolicy::Never => opts |= OpenOptions::DIRECT_IO,
-            CachePolicy::Metadata => opts |= OpenOptions::DIRECT_IO,
-            CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
-            _ => {}
-        };
-
-        Ok((entry, Some(handle), opts))
+    #[cfg(feature = "iouring")]
+    async fn create_async(
+        &self,
+        ctx: Context,
+        parent: Self::Inode,
+        name: &CStr,
+        mode: u32,
+        kill_priv: bool,
+        flags: u32,
+        umask: u32,
+        extensions: Extensions,
+    ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions)> {
+        if self.is_io_uring_op_supported(opcode::OpenAt2::CODE) {
+            self.create_inner_async(ctx, parent, name, mode, kill_priv, flags, umask, extensions)
+                .await
+        } else {
+            self.create(ctx, parent, name, mode, kill_priv, flags, umask, extensions)
+        }
     }
 
     fn unlink(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
@@ -1827,8 +2133,28 @@ impl FileSystem for PassthroughFs {
 
         // This is safe because read_from_file_at uses preadv64, so the underlying file descriptor
         // offset is not affected by this operation.
-        let f = data.file.get()?.read().unwrap();
+        let f = data.file.get()?.read_blocking();
         w.read_from_file_at(f.get_file(), size as usize, offset, None)
+    }
+
+    #[cfg(feature = "iouring")]
+    async fn read_async<R: AsyncZeroCopyWriter + Send>(
+        &self,
+        ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        r: R,
+        size: u32,
+        offset: u64,
+        lock_owner: Option<u64>,
+        flags: u32,
+    ) -> io::Result<usize> {
+        if self.is_io_uring_op_supported(opcode::Readv::CODE) {
+            self.do_read_async(ctx, inode, handle, r, size, offset, lock_owner, flags)
+                .await
+        } else {
+            self.read(ctx, inode, handle, r, size, offset, lock_owner, flags)
+        }
     }
 
     fn write<R: ZeroCopyReader>(
@@ -1848,7 +2174,7 @@ impl FileSystem for PassthroughFs {
 
         // This is safe because write_to_file_at uses `pwritev2(2)`, so the underlying file
         // descriptor offset is not affected by this operation.
-        let f = data.file.get()?.read().unwrap();
+        let f = data.file.get()?.read_blocking();
 
         {
             let _killpriv_guard = if self.cfg.killpriv_v2 && kill_priv {
@@ -1871,6 +2197,51 @@ impl FileSystem for PassthroughFs {
             let is_append = flags & libc::O_APPEND as u32 != 0;
             let flags = (!delayed_write && is_append).then_some(oslib::WritevFlags::RWF_APPEND);
             r.write_to_file_at(f.get_file(), size as usize, offset, flags)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(feature = "iouring")]
+    async fn write_async<R: AsyncZeroCopyReader + Send>(
+        &self,
+        ctx: Context,
+        inode: <Self as FileSystem>::Inode,
+        handle: <Self as FileSystem>::Handle,
+        r: R,
+        size: u32,
+        offset: u64,
+        lock_owner: Option<u64>,
+        delayed_write: bool,
+        kill_priv: bool,
+        flags: u32,
+    ) -> io::Result<usize> {
+        if self.is_io_uring_op_supported(opcode::Writev::CODE) {
+            self.do_write_async(
+                ctx,
+                inode,
+                handle,
+                r,
+                size,
+                offset,
+                lock_owner,
+                delayed_write,
+                kill_priv,
+                flags,
+            )
+            .await
+        } else {
+            self.write(
+                ctx,
+                inode,
+                handle,
+                r,
+                size,
+                offset,
+                lock_owner,
+                delayed_write,
+                kill_priv,
+                flags,
+            )
         }
     }
 
@@ -1912,7 +2283,7 @@ impl FileSystem for PassthroughFs {
         let data = if let Some(handle) = handle {
             let hd = self.find_handle(handle, inode)?;
 
-            let fd = hd.file.get()?.write().unwrap().as_raw_fd();
+            let fd = hd.file.get()?.write_blocking().as_raw_fd();
             Data::Handle(hd, fd)
         } else {
             let pathname = CString::new(format!("{}", inode_file.as_raw_fd()))
@@ -2038,48 +2409,32 @@ impl FileSystem for PassthroughFs {
 
     fn rename(
         &self,
-        _ctx: Context,
+        ctx: Context,
         olddir: Inode,
         oldname: &CStr,
         newdir: Inode,
         newname: &CStr,
         flags: u32,
     ) -> io::Result<()> {
-        let old_inode = self.inodes.get(olddir).ok_or_else(ebadf)?;
-        let new_inode = self.inodes.get(newdir).ok_or_else(ebadf)?;
+        self.do_rename(ctx, olddir, oldname, newdir, newname, flags)
+    }
 
-        let old_file = old_inode.get_file()?;
-        let new_file = new_inode.get_file()?;
-
-        let invalidated_inode = self.before_invalidating_path(&new_inode, newname);
-        // Safe because this doesn't modify any memory and we check the return value.
-        // TODO: Switch to libc::renameat2 once https://github.com/rust-lang/libc/pull/1508 lands
-        // and we have glibc 2.28.
-        let res = unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                old_file.as_raw_fd(),
-                oldname.as_ptr(),
-                new_file.as_raw_fd(),
-                newname.as_ptr(),
-                flags,
-            )
-        };
-        if let Some(invalidated_inode) = invalidated_inode {
-            self.after_invalidating_path(invalidated_inode, "Overwrote (via rename)");
+    #[cfg(feature = "iouring")]
+    async fn rename_async(
+        &self,
+        ctx: Context,
+        olddir: Self::Inode,
+        oldname: &CStr,
+        newdir: Self::Inode,
+        newname: &CStr,
+        flags: u32,
+    ) -> io::Result<()> {
+        if self.is_io_uring_op_supported(opcode::RenameAt::CODE) {
+            self.do_rename_async(ctx, olddir, oldname, newdir, newname, flags)
+                .await
+        } else {
+            self.rename(ctx, olddir, oldname, newdir, newname, flags)
         }
-        if res != 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        if let Err(err) = self.update_inode_migration_info(new_inode, newname) {
-            warn!(
-                "Failed to update renamed file's ({oldname:?} -> {newname:?}) migration info, \
-                the migration destination may be unable to find it: {err}",
-            );
-        }
-
-        Ok(())
     }
 
     fn mknod(
@@ -2248,7 +2603,7 @@ impl FileSystem for PassthroughFs {
         // behavior by doing the same thing (dup-ing the fd and then immediately closing it). Safe
         // because this doesn't modify any memory and we check the return values.
         unsafe {
-            let newfd = libc::dup(data.file.get()?.write().unwrap().as_raw_fd());
+            let newfd = libc::dup(data.file.get()?.write_blocking().as_raw_fd());
             if newfd < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -2264,7 +2619,7 @@ impl FileSystem for PassthroughFs {
     fn fsync(&self, _ctx: Context, inode: Inode, datasync: bool, handle: Handle) -> io::Result<()> {
         let data = self.find_handle(handle, inode)?;
 
-        let fd = data.file.get()?.write().unwrap().as_raw_fd();
+        let fd = data.file.get()?.write_blocking().as_raw_fd();
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe {
@@ -2585,7 +2940,7 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<()> {
         let data = self.find_handle(handle, inode)?;
 
-        let fd = data.file.get()?.write().unwrap().as_raw_fd();
+        let fd = data.file.get()?.write_blocking().as_raw_fd();
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe {
             libc::fallocate64(
@@ -2612,7 +2967,7 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<u64> {
         let data = self.find_handle(handle, inode)?;
 
-        let fd = data.file.get()?.write().unwrap().as_raw_fd();
+        let fd = data.file.get()?.write_blocking().as_raw_fd();
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::lseek(fd, offset as libc::off64_t, whence as libc::c_int) };
@@ -2638,12 +2993,12 @@ impl FileSystem for PassthroughFs {
         let data_in = self.find_handle(handle_in, inode_in)?;
 
         // Take just a read lock as we're not going to alter the file descriptor offset.
-        let fd_in = data_in.file.get()?.read().unwrap().as_raw_fd();
+        let fd_in = data_in.file.get()?.read_blocking().as_raw_fd();
 
         let data_out = self.find_handle(handle_out, inode_out)?;
 
         // Take just a read lock as we're not going to alter the file descriptor offset.
-        let fd_out = data_out.file.get()?.read().unwrap().as_raw_fd();
+        let fd_out = data_out.file.get()?.read_blocking().as_raw_fd();
 
         // Safe because this will only modify `offset_in` and `offset_out` and we check
         // the return value.
@@ -2682,7 +3037,7 @@ impl FileSystem for PassthroughFs {
 }
 
 impl HandleDataFile {
-    fn get(&self) -> io::Result<&'_ RwLock<GuestFile>> {
+    fn get(&self) -> io::Result<&'_ SmolRwLock<GuestFile>> {
         match self {
             HandleDataFile::File(file) => Ok(file),
             HandleDataFile::Invalid(err) => Err(io::Error::new(
@@ -2695,7 +3050,7 @@ impl HandleDataFile {
 
 impl From<GuestFile> for HandleDataFile {
     fn from(file: GuestFile) -> Self {
-        HandleDataFile::File(RwLock::new(file))
+        HandleDataFile::File(SmolRwLock::new(file))
     }
 }
 

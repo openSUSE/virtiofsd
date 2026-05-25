@@ -2,6 +2,9 @@
 //
 // SPDX-License-Identifier: (Apache-2.0 AND BSD-3-Clause)
 
+#[cfg(feature = "iouring")]
+pub mod vhost_user_async;
+
 use std::convert::TryInto;
 use std::fs::File;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,6 +15,8 @@ use std::{convert, error, fmt, io};
 use futures::executor::{ThreadPool, ThreadPoolBuilder};
 use log::*;
 
+#[cfg(feature = "iouring")]
+use smol::future;
 use vhost::vhost_user::message::*;
 use vhost::vhost_user::Backend;
 use vhost_user_backend::bitmap::BitmapMmapRegion;
@@ -29,6 +34,8 @@ use vmm_sys_util::event::{
     new_event_consumer_and_notifier, EventConsumer, EventFlag, EventNotifier,
 };
 
+#[cfg(feature = "iouring")]
+use crate::async_wrappers::IoUringRuntimeWithEventFd;
 use crate::descriptor_utils::{Error as VufDescriptorError, Reader, Writer};
 use crate::filesystem::{FileSystem, SerializableFileSystem};
 use crate::server::Server;
@@ -50,6 +57,10 @@ const NUM_QUEUES: usize = REQUEST_QUEUES as usize + 1;
 const HIPRIO_QUEUE_EVENT: u16 = 0;
 // The guest queued an available buffer for the request queue.
 const REQ_QUEUE_EVENT: u16 = 1;
+/// The io_uring completion event.
+/// In addition to the event FDs used by our virtqueues, there is an exit event FD used internally by the vhost-user-backend crate.
+#[cfg(feature = "iouring")]
+pub const IO_URING_EVENT: u16 = NUM_QUEUES as u16 + 1;
 
 /// The maximum length of the tag being used.
 pub const MAX_TAG_LEN: usize = 36;
@@ -121,11 +132,18 @@ struct VhostUserFsThread<F: FileSystem + Send + Sync + 'static> {
     vu_req: Option<Backend>,
     event_idx: bool,
     pool: Option<ThreadPool>,
+    // IoUring related fields
+    #[cfg(feature = "iouring")]
+    io_uring_runtime: Option<IoUringRuntimeWithEventFd>,
 }
 
 impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFsThread<F> {
-    fn new(fs: F, thread_pool_size: usize) -> Result<Self> {
-        let pool = if thread_pool_size > 0 {
+    fn new(
+        fs: F,
+        thread_pool_size: usize,
+        #[cfg(feature = "iouring")] io_uring_runtime: Option<IoUringRuntimeWithEventFd>,
+    ) -> Result<Self> {
+        if thread_pool_size > 0 {
             // Test that unshare(CLONE_FS) works, it will be called for each thread.
             // It's an unprivileged system call but some Docker/Moby versions are
             // known to reject it via seccomp when CAP_SYS_ADMIN is not given.
@@ -136,7 +154,12 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
             if ret == -1 {
                 return Err(Error::UnshareCloneFs(std::io::Error::last_os_error()));
             }
-
+        }
+        #[cfg(feature = "iouring")]
+        let use_thread_pool = thread_pool_size > 0 && io_uring_runtime.is_none();
+        #[cfg(not(feature = "iouring"))]
+        let use_thread_pool = thread_pool_size > 0;
+        let pool = if use_thread_pool {
             Some(
                 ThreadPoolBuilder::new()
                     .after_start(|_| {
@@ -151,6 +174,27 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
         } else {
             None
         };
+        #[cfg(feature = "iouring")]
+        match io_uring_runtime {
+            Some(ref runtime) if thread_pool_size > 0 => {
+                for i in 0..thread_pool_size {
+                    let executor = Arc::clone(&runtime.io_uring_runtime.executor);
+                    std::thread::spawn(move || {
+                        log::debug!("Spawning a thread({}) to handle io_uring events", i);
+                        // unshare FS for xattr operation
+                        let ret = unsafe { libc::unshare(libc::CLONE_FS) };
+                        assert_eq!(ret, 0); // Should not fail
+
+                        // Run `executor` until the given future completes, i.e. forever.
+                        // This will not only run the `pending` future, but any future spawned on the
+                        // executor from elsewhere (i.e. from `VhostUserFsThread::process_queue_async()`)
+                        // – unless another thread grabbed it before this one.
+                        future::block_on(executor.run(future::pending::<()>()));
+                    });
+                }
+            }
+            _ => {}
+        };
 
         Ok(VhostUserFsThread {
             mem: None,
@@ -158,6 +202,8 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
             vu_req: None,
             event_idx: false,
             pool,
+            #[cfg(feature = "iouring")]
+            io_uring_runtime,
         })
     }
 
@@ -388,9 +434,11 @@ struct PremigrationThread {
 }
 
 /// A builder for configurable creation of [`VhostUserFsBackend`] objects.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct VhostUserFsBackendBuilder {
     thread_pool_size: usize,
+    #[cfg(feature = "iouring")]
+    io_uring_runtime: Option<IoUringRuntimeWithEventFd>,
     tag: Option<String>,
 }
 
@@ -400,6 +448,15 @@ impl VhostUserFsBackendBuilder {
     /// A value of `0` disables the usage of a thread pool.
     pub fn set_thread_pool_size(mut self, size: usize) -> Self {
         self.thread_pool_size = size;
+        self
+    }
+
+    #[cfg(feature = "iouring")]
+    pub fn set_io_uring_runtime(
+        mut self,
+        io_uring_runtime: Option<IoUringRuntimeWithEventFd>,
+    ) -> Self {
+        self.io_uring_runtime = io_uring_runtime;
         self
     }
 
@@ -416,11 +473,22 @@ impl VhostUserFsBackendBuilder {
     where
         F: FileSystem + SerializableFileSystem + Send + Sync + 'static,
     {
-        let thread = RwLock::new(VhostUserFsThread::new(fs, self.thread_pool_size)?);
+        #[cfg(feature = "iouring")]
+        let use_io_uring = self.io_uring_runtime.is_some();
+
+        let thread = VhostUserFsThread::new(
+            fs,
+            self.thread_pool_size,
+            #[cfg(feature = "iouring")]
+            self.io_uring_runtime,
+        )?;
+
         Ok(VhostUserFsBackend {
-            thread,
+            thread: RwLock::new(thread),
             premigration_thread: None.into(),
             migration_thread: None.into(),
+            #[cfg(feature = "iouring")]
+            use_io_uring,
             tag: self.tag,
         })
     }
@@ -428,6 +496,8 @@ impl VhostUserFsBackendBuilder {
 
 pub struct VhostUserFsBackend<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> {
     thread: RwLock<VhostUserFsThread<F>>,
+    #[cfg(feature = "iouring")]
+    use_io_uring: bool,
     premigration_thread: Mutex<Option<PremigrationThread>>,
     migration_thread: Mutex<Option<JoinHandle<io::Result<()>>>>,
     tag: Option<String>,
@@ -445,6 +515,10 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
 
 impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserBackend
     for VhostUserFsBackend<F>
+where
+    <F as FileSystem>::Inode: Send,
+    <F as FileSystem>::Handle: Send,
+    <F as FileSystem>::DirIter: Send,
 {
     type Bitmap = BitmapMmapRegion;
     type Vring = VringMutex<LoggedMemoryAtomic>;
@@ -571,6 +645,10 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserBa
 
         let thread = self.thread.read().unwrap();
 
+        #[cfg(feature = "iouring")]
+        if self.use_io_uring {
+            return thread.handle_event_async(device_event, vrings);
+        }
         if thread.pool.is_some() {
             thread.handle_event_pool(device_event, vrings)
         } else {

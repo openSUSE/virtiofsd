@@ -11,6 +11,10 @@
 
 use super::util::{einval, erofs};
 use super::PassthroughFs;
+#[cfg(feature = "iouring")]
+use crate::async_wrappers::IoUringRuntimeWithEventFd;
+#[cfg(feature = "iouring")]
+use crate::filesystem::filesystem_async::{AsyncZeroCopyReader, AsyncZeroCopyWriter};
 use crate::filesystem::{
     Context, Entry, Extensions, FileSystem, FsOptions, GetxattrReply, ListxattrReply, OpenOptions,
     SerializableFileSystem, SetattrValid, SetxattrFlags, ZeroCopyReader, ZeroCopyWriter,
@@ -34,8 +38,15 @@ impl PassthroughFsRo {
     ///
     /// Internally creates a `PassthroughFs` filesystem using the `cfg` configuration, then wraps
     /// it in the `PassthroughFsRo` type.
-    pub fn new(cfg: super::Config) -> io::Result<Self> {
-        let inner = PassthroughFs::new(cfg)?;
+    pub fn new(
+        cfg: super::Config,
+        #[cfg(feature = "iouring")] io_uring_runtime: Option<&IoUringRuntimeWithEventFd>,
+    ) -> io::Result<Self> {
+        let inner = PassthroughFs::new(
+            cfg,
+            #[cfg(feature = "iouring")]
+            io_uring_runtime,
+        )?;
         Ok(PassthroughFsRo(inner))
     }
 
@@ -168,6 +179,7 @@ macro_rules! ops_forbid {
     }
 }
 
+#[cfg_attr(feature = "iouring", async_trait::async_trait)]
 impl FileSystem for PassthroughFsRo {
     type Inode = <PassthroughFs as FileSystem>::Inode;
     type Handle = <PassthroughFs as FileSystem>::Handle;
@@ -266,6 +278,22 @@ impl FileSystem for PassthroughFsRo {
             whence: u32,
         ) -> io::Result<u64>;
         fn syncfs(&self, ctx: Context, inode: Self::Inode) -> io::Result<()>;
+    }
+    #[cfg(feature = "iouring")]
+    async fn read_async<W: AsyncZeroCopyWriter + Send>(
+        &self,
+        ctx: Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        w: W,
+        size: u32,
+        offset: u64,
+        lock_owner: Option<u64>,
+        flags: u32,
+    ) -> io::Result<usize> {
+        self.0
+            .read_async(ctx, inode, handle, w, size, offset, lock_owner, flags)
+            .await
     }
 
     // Refuse to run these functions, always returning EROFS.
@@ -375,6 +403,49 @@ impl FileSystem for PassthroughFsRo {
             _len: u64,
             _flags: u64,
         ) -> io::Result<usize>;
+    }
+    #[cfg(feature = "iouring")]
+    async fn rename_async(
+        &self,
+        _ctx: Context,
+        _olddir: Self::Inode,
+        _oldname: &CStr,
+        _newdir: Self::Inode,
+        _newname: &CStr,
+        _flags: u32,
+    ) -> io::Result<()> {
+        Err(erofs())
+    }
+    #[cfg(feature = "iouring")]
+    async fn write_async<R: AsyncZeroCopyReader + Send>(
+        &self,
+        _ctx: Context,
+        _inode: Self::Inode,
+        _handle: Self::Handle,
+        _r: R,
+        _size: u32,
+        _offset: u64,
+        _lock_owner: Option<u64>,
+        _delayed_write: bool,
+        _kill_priv: bool,
+        _flags: u32,
+    ) -> io::Result<usize> {
+        Err(erofs())
+    }
+    #[cfg(feature = "iouring")]
+    async fn create_async(
+        &self,
+        ctx: Context,
+        parent: Self::Inode,
+        name: &CStr,
+        mode: u32,
+        kill_priv: bool,
+        flags: u32,
+        umask: u32,
+        extensions: Extensions,
+    ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions)> {
+        // Read-only `create` is a bit complex, so for now we delegate to the sync implementation.
+        self.create(ctx, parent, name, mode, kill_priv, flags, umask, extensions)
     }
 
     fn open(

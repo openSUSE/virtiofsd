@@ -2,6 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#[cfg(feature = "iouring")]
+pub mod file_traits_async;
+
 use std::convert::TryInto;
 use std::fs::File;
 use std::io::Result;
