@@ -227,6 +227,7 @@ pub trait DirectoryIterator {
 }
 
 /// The main trait that connects a file system with a transport.
+#[cfg_attr(feature = "iouring", async_trait::async_trait)]
 #[allow(unused_variables)]
 pub trait FileSystem {
     /// Represents a location in the filesystem tree and can be used to perform operations that act
@@ -251,14 +252,14 @@ pub trait FileSystem {
     ///
     /// Note that if a file system will be exported over NFS the `Inode`'s lifetime must extend even
     /// beyond `forget`. See the `generation` field in `Entry`.
-    type Inode: From<u64> + Into<u64>;
+    type Inode: From<u64> + Into<u64> + Send;
 
     /// Represents a file or directory that is open for reading/writing.
-    type Handle: From<u64> + Into<u64>;
+    type Handle: From<u64> + Into<u64> + Send;
 
     /// An iterator over the entries of a directory. See the documentation for `readdir` for more
     /// details.
-    type DirIter: DirectoryIterator;
+    type DirIter: DirectoryIterator + Send;
 
     /// Initialize the file system.
     ///
