@@ -143,7 +143,7 @@ where
                 Opcode::Setlk => self.setlk(in_header, r, w),
                 Opcode::Setlkw => self.setlkw(in_header, r, w),
                 Opcode::Access => self.access(in_header, r, w),
-                Opcode::Create => self.create(in_header, r, w),
+                Opcode::Create => self.create_async(in_header, r, w).await,
                 Opcode::Interrupt => Ok(self.interrupt(in_header)),
                 Opcode::Bmap => self.bmap(in_header, r, w),
                 Opcode::Destroy => Ok(self.destroy()),

@@ -13,7 +13,6 @@ use crate::passthrough::PassthroughFs;
 use crate::soft_idmap::{GuestGid, GuestUid};
 
 /// A key that [`PersonalityStore`] internally uses to map personality IDs.
-#[allow(unused)]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PersonalityKey {
     uid: GuestUid,
@@ -22,7 +21,6 @@ struct PersonalityKey {
     umask: u32,
 }
 
-#[allow(unused)]
 impl PersonalityKey {
     fn new(ctx: &Context, extensions: Extensions, umask: u32) -> PersonalityKey {
         PersonalityKey {
@@ -34,13 +32,11 @@ impl PersonalityKey {
     }
 }
 
-#[allow(unused)]
 /// A store for personality IDs used by io_uring.
 pub(crate) struct PersonalityStore {
     map: RwLock<BTreeMap<PersonalityKey, u16>>,
 }
 
-#[allow(unused)]
 impl PersonalityStore {
     pub fn new() -> PersonalityStore {
         PersonalityStore {

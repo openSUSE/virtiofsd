@@ -432,6 +432,21 @@ impl FileSystem for PassthroughFsRo {
     ) -> io::Result<usize> {
         Err(erofs())
     }
+    #[cfg(feature = "iouring")]
+    async fn create_async(
+        &self,
+        ctx: Context,
+        parent: Self::Inode,
+        name: &CStr,
+        mode: u32,
+        kill_priv: bool,
+        flags: u32,
+        umask: u32,
+        extensions: Extensions,
+    ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions)> {
+        // Read-only `create` is a bit complex, so for now we delegate to the sync implementation.
+        self.create(ctx, parent, name, mode, kill_priv, flags, umask, extensions)
+    }
 
     fn open(
         &self,

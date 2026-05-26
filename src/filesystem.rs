@@ -586,6 +586,23 @@ pub trait FileSystem {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
+    /// Asynchronous variant of [`FileSystem::create`].
+    #[cfg(feature = "iouring")]
+    #[allow(clippy::too_many_arguments)]
+    async fn create_async(
+        &self,
+        ctx: Context,
+        parent: Self::Inode,
+        name: &CStr,
+        mode: u32,
+        kill_priv: bool,
+        flags: u32,
+        umask: u32,
+        extensions: Extensions,
+    ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions)> {
+        self.create(ctx, parent, name, mode, kill_priv, flags, umask, extensions)
+    }
+
     /// Read data from a file.
     ///
     /// Returns `size` bytes of data starting from offset `off` from the file associated with
