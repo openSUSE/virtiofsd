@@ -184,10 +184,14 @@ impl<'a, B: BitmapSlice> DescriptorChainConsumer<'a, B> {
 /// descriptors after any device-readable descriptors (2.6.4.2 in Virtio Spec v1.1).
 /// Reader will skip iterating over descriptor chain when first writable
 /// descriptor is encountered.
-#[derive(Clone)]
 pub struct Reader<'a, B = BitmapMmapRegion> {
     buffer: DescriptorChainConsumer<'a, B>,
 }
+
+/// Safety: `Reader` can be safely accessed from different thread from that created it.
+/// Especially, since `Reader` does not implement `Clone`, we can guarantee that `Reader`
+/// will *not* have a mutable access to the memory region from different threads.
+unsafe impl<B: Send> Send for Reader<'_, B> {}
 
 impl<'a, B: Bitmap + BitmapSlice + 'static> Reader<'a, B> {
     /// Construct a new Reader wrapper over `desc_chain`.
@@ -315,10 +319,14 @@ impl<B: BitmapSlice> io::Read for Reader<'_, B> {
 /// descriptors after any device-readable descriptors (2.6.4.2 in Virtio Spec v1.1).
 /// Writer will start iterating the descriptors from the first writable one and will
 /// assume that all following descriptors are writable.
-#[derive(Clone)]
 pub struct Writer<'a, B = BitmapMmapRegion> {
     buffer: DescriptorChainConsumer<'a, B>,
 }
+
+/// Safety: `Writer` can be safely accessed from different thread from that created it.
+/// Especially, since `Writer` does not implement `Clone`, we can guarantee that `Writer`
+/// will *not* have a mutable access to the memory region from different threads.
+unsafe impl<B: Send> Send for Writer<'_, B> {}
 
 impl<'a, B: Bitmap + BitmapSlice + 'static> Writer<'a, B> {
     /// Construct a new Writer wrapper over `desc_chain`.

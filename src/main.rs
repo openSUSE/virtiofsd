@@ -7,6 +7,8 @@ use passthrough::xattrmap::XattrMap;
 use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::ffi::CString;
+#[cfg(feature = "iouring")]
+use std::os::fd::AsRawFd;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::Path;
 use std::str::FromStr;
@@ -21,6 +23,8 @@ use vhost::vhost_user::Error::Disconnected;
 use vhost::vhost_user::Listener;
 use vhost_user_backend::Error::HandleRequest;
 use vhost_user_backend::VhostUserDaemon;
+#[cfg(feature = "iouring")]
+use virtiofsd::async_wrappers::{IoUringRuntime, IoUringRuntimeWithEventFd};
 use virtiofsd::filesystem::{FileSystem, SerializableFileSystem};
 use virtiofsd::passthrough::read_only::PassthroughFsRo;
 use virtiofsd::passthrough::{
@@ -29,9 +33,13 @@ use virtiofsd::passthrough::{
 use virtiofsd::sandbox::{Sandbox, SandboxMode};
 use virtiofsd::seccomp::{enable_seccomp, SeccompAction};
 use virtiofsd::util::write_pid_file;
+#[cfg(feature = "iouring")]
+use virtiofsd::vhost_user::IO_URING_EVENT;
 use virtiofsd::vhost_user::{Error, VhostUserFsBackendBuilder, MAX_TAG_LEN};
 use virtiofsd::{limits, oslib, soft_idmap};
 use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
+#[cfg(feature = "iouring")]
+use vmm_sys_util::{epoll::EventSet, eventfd::EventFd};
 
 /// Maximum number of memory areas (slots) supported by the vhost-user-backend crate.
 ///
@@ -412,6 +420,11 @@ struct Opt {
     /// This parameter is ignored on the destination side.
     #[arg(long = "migration-confirm-paths")]
     migration_confirm_paths: bool,
+
+    /// Use io_uring for underlying host-side I/O operations.
+    #[cfg(feature = "iouring")]
+    #[arg(long)]
+    io_uring: bool,
 }
 
 fn parse_compat(opt: Opt) -> Opt {
@@ -847,13 +860,18 @@ fn main() {
         uid_map: Some(opt.translate_uid),
         gid_map: Some(opt.translate_gid),
         guest_fd_limit,
+        #[cfg(feature = "iouring")]
+        use_io_uring: opt.io_uring,
         ..Default::default()
     };
 
     // Must happen before we start the thread pool
     match opt.seccomp {
         SeccompAction::Allow => {}
-        _ => enable_seccomp(opt.seccomp, opt.syslog).unwrap(),
+        #[cfg(feature = "iouring")]
+        _ => enable_seccomp(opt.seccomp, opt.syslog, opt.io_uring).unwrap(),
+        #[cfg(not(feature = "iouring"))]
+        _ => enable_seccomp(opt.seccomp, opt.syslog, false).unwrap(),
     }
 
     // We don't modify the capabilities if the user call us without
@@ -863,18 +881,55 @@ fn main() {
         drop_capabilities(fs_cfg.inode_file_handles, opt.modcaps);
     }
 
-    if opt.readonly {
-        let fs = PassthroughFsRo::new(fs_cfg).unwrap_or_else(|e| {
-            error!("Failed to create internal filesystem representation: {e}");
-            process::exit(1);
-        });
-        run_generic_fs(fs, listener, thread_pool_size, opt.tag);
+    #[cfg(feature = "iouring")]
+    let io_uring_runtime = if opt.io_uring {
+        let io_uring = io_uring::IoUring::builder().build(256).unwrap();
+        let executor = Arc::new(smol::Executor::new());
+        let eventfd = EventFd::new(0).unwrap();
+        Some(IoUringRuntimeWithEventFd::new(
+            IoUringRuntime::new(io_uring, Arc::clone(&executor)),
+            eventfd,
+        ))
     } else {
-        let fs = PassthroughFs::new(fs_cfg).unwrap_or_else(|e| {
+        None
+    };
+
+    if opt.readonly {
+        let fs = PassthroughFsRo::new(
+            fs_cfg,
+            #[cfg(feature = "iouring")]
+            io_uring_runtime.as_ref(),
+        )
+        .unwrap_or_else(|e| {
             error!("Failed to create internal filesystem representation: {e}");
             process::exit(1);
         });
-        run_generic_fs(fs, listener, thread_pool_size, opt.tag);
+        run_generic_fs(
+            fs,
+            listener,
+            thread_pool_size,
+            opt.tag,
+            #[cfg(feature = "iouring")]
+            io_uring_runtime,
+        );
+    } else {
+        let fs = PassthroughFs::new(
+            fs_cfg,
+            #[cfg(feature = "iouring")]
+            io_uring_runtime.as_ref(),
+        )
+        .unwrap_or_else(|e| {
+            error!("Failed to create internal filesystem representation: {e}");
+            process::exit(1);
+        });
+        run_generic_fs(
+            fs,
+            listener,
+            thread_pool_size,
+            opt.tag,
+            #[cfg(feature = "iouring")]
+            io_uring_runtime,
+        );
     }
 }
 
@@ -884,17 +939,23 @@ fn run_generic_fs<F: FileSystem + SerializableFileSystem + Send + Sync + 'static
     mut listener: Listener,
     thread_pool_size: usize,
     tag: Option<String>,
-) {
-    let fs_backend = Arc::new(
-        VhostUserFsBackendBuilder::default()
-            .set_thread_pool_size(thread_pool_size)
-            .set_tag(tag)
-            .build(fs)
-            .unwrap_or_else(|error| {
-                error!("Error creating vhost-user backend: {error}");
-                process::exit(1)
-            }),
-    );
+    #[cfg(feature = "iouring")] io_uring_runtime: Option<IoUringRuntimeWithEventFd>,
+) where
+    <F as FileSystem>::Inode: Send,
+    <F as FileSystem>::Handle: Send,
+    <F as FileSystem>::DirIter: Send,
+{
+    #[cfg(feature = "iouring")]
+    let io_uring_eventfd_raw = io_uring_runtime.as_ref().map(|r| r.event_fd().as_raw_fd());
+    let builder = VhostUserFsBackendBuilder::default()
+        .set_thread_pool_size(thread_pool_size)
+        .set_tag(tag);
+    #[cfg(feature = "iouring")]
+    let builder = builder.set_io_uring_runtime(io_uring_runtime);
+    let fs_backend = Arc::new(builder.build(fs).unwrap_or_else(|error| {
+        error!("Error creating vhost-user backend: {error}");
+        process::exit(1)
+    }));
 
     let mut daemon = VhostUserDaemon::new(
         String::from("virtiofsd-backend"),
@@ -902,6 +963,15 @@ fn run_generic_fs<F: FileSystem + SerializableFileSystem + Send + Sync + 'static
         GuestMemoryAtomic::new(GuestMemoryMmap::new()),
     )
     .unwrap();
+
+    #[cfg(feature = "iouring")]
+    if let Some(io_uring_eventfd_raw) = io_uring_eventfd_raw {
+        daemon.get_epoll_handlers().iter().for_each(|handler| {
+            handler
+                .register_listener(io_uring_eventfd_raw, EventSet::IN, IO_URING_EVENT as u64)
+                .unwrap();
+        });
+    }
 
     info!("Waiting for vhost-user socket connection...");
 

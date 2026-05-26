@@ -5,6 +5,8 @@
 #[macro_use]
 extern crate log;
 
+#[cfg(feature = "iouring")]
+pub mod async_wrappers;
 pub mod descriptor_utils;
 pub mod file_traits;
 pub mod filesystem;

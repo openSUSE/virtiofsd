@@ -11,6 +11,8 @@
 
 use super::util::{einval, erofs};
 use super::PassthroughFs;
+#[cfg(feature = "iouring")]
+use crate::async_wrappers::IoUringRuntimeWithEventFd;
 use crate::filesystem::{
     Context, Entry, Extensions, FileSystem, FsOptions, GetxattrReply, ListxattrReply, OpenOptions,
     SerializableFileSystem, SetattrValid, SetxattrFlags, ZeroCopyReader, ZeroCopyWriter,
@@ -34,8 +36,15 @@ impl PassthroughFsRo {
     ///
     /// Internally creates a `PassthroughFs` filesystem using the `cfg` configuration, then wraps
     /// it in the `PassthroughFsRo` type.
-    pub fn new(cfg: super::Config) -> io::Result<Self> {
-        let inner = PassthroughFs::new(cfg)?;
+    pub fn new(
+        cfg: super::Config,
+        #[cfg(feature = "iouring")] io_uring_runtime: Option<&IoUringRuntimeWithEventFd>,
+    ) -> io::Result<Self> {
+        let inner = PassthroughFs::new(
+            cfg,
+            #[cfg(feature = "iouring")]
+            io_uring_runtime,
+        )?;
         Ok(PassthroughFsRo(inner))
     }
 
@@ -168,6 +177,7 @@ macro_rules! ops_forbid {
     }
 }
 
+#[cfg_attr(feature = "iouring", async_trait::async_trait)]
 impl FileSystem for PassthroughFsRo {
     type Inode = <PassthroughFs as FileSystem>::Inode;
     type Handle = <PassthroughFs as FileSystem>::Handle;

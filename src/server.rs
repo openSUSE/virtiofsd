@@ -2,6 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#[cfg(feature = "iouring")]
+pub mod server_async;
+
 use crate::descriptor_utils::{Reader, Writer};
 use crate::filesystem::{
     Context, DirEntry, DirectoryIterator, Entry, Extensions, FileSystem, GetxattrReply,
