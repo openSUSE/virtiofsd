@@ -977,18 +977,153 @@ pub trait FileSystem {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
-    /// TODO: support this
-    fn getlk(&self) -> io::Result<()> {
+    /// Test for a conflicting lock on a file.
+    ///
+    /// This handles the FUSE_GETLK opcode. It is only used for POSIX/OFD advisory lock queries
+    /// (`fcntl(F_GETLK)` / `fcntl(F_OFD_GETLK)` in the guest). BSD `flock()` has no query
+    /// operation and does not use this method.
+    ///
+    /// `owner` identifies the lock owner and corresponds to the `lock_owner` passed to `flush`
+    /// and `release`. For POSIX locks, all locks from the same process share one owner. For OFD
+    /// locks, each open file description gets a unique owner. Setting `POSIX_LOCKS` causes the
+    /// kernel to forward both POSIX and OFD lock requests through this method — they cannot be
+    /// enabled separately. The kernel rewrites `F_OFD_GETLK` to `F_GETLK` before sending, so
+    /// the daemon cannot distinguish the two; the only observable difference is that OFD locks
+    /// produce per-file-description `owner` values rather than per-process ones.
+    ///
+    /// `lock` describes the byte range and lock type being queried. `flags` contains the FUSE
+    /// lock flags (see `fuse::LK_FLOCK`), though in practice `getlk` is not called for `flock()`
+    /// operations.
+    ///
+    /// If a conflicting lock is held by another owner, return the details of that lock. If no
+    /// conflicting lock exists, return a `FileLock` with `type_` set to `F_UNLCK`.
+    ///
+    /// # Required `FsOptions`
+    ///
+    /// This method is only called when `FsOptions::POSIX_LOCKS` is set during `init`.
+    ///
+    /// # Error handling
+    ///
+    /// - `ENOLCK` — rejects this request but the kernel continues forwarding future lock calls
+    ///   to the daemon. Use this to refuse lock types you don't support.
+    /// - `ENOSYS` — the kernel treats it as a permanent failure and handles all subsequent lock
+    ///   calls locally inside the guest. This is safe when only one VM accesses the volume
+    ///   (including the default passthrough case), since the guest kernel's local lock manager
+    ///   is correct within a single VM. It is **dangerous** when multiple VMs share a volume:
+    ///   the guest application sees no error, but locks silently have guest-local scope only.
+    fn getlk(
+        &self,
+        _ctx: Context,
+        _inode: Self::Inode,
+        _handle: Self::Handle,
+        _owner: u64,
+        _lock: fuse::FileLock,
+        _flags: u32,
+    ) -> io::Result<fuse::FileLock> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
-    /// TODO: support this
-    fn setlk(&self) -> io::Result<()> {
+    /// Acquire, modify, or release an advisory lock on a file.
+    ///
+    /// This handles the FUSE_SETLK opcode. **Both** `fcntl()` advisory locks and `flock()`
+    /// calls arrive here — check `flags & fuse::LK_FLOCK` to distinguish them:
+    ///
+    /// - **`LK_FLOCK` set**: the request originates from a guest `flock()` call. The lock is
+    ///   whole-file; `lock.start` and `lock.end` should be ignored. `lock.type_` carries
+    ///   `F_RDLCK` (`LOCK_SH`), `F_WRLCK` (`LOCK_EX`), or `F_UNLCK` (`LOCK_UN`).
+    ///   Requires `FsOptions::FLOCK_LOCKS` in `init`.
+    ///
+    /// - **`LK_FLOCK` not set**: the request originates from `fcntl(F_SETLK)` or
+    ///   `fcntl(F_OFD_SETLK)` in the guest. Setting `POSIX_LOCKS` causes the kernel to forward
+    ///   both POSIX and OFD locks — they cannot be enabled separately. The kernel rewrites
+    ///   `F_OFD_SETLK` to `F_SETLK`, so the daemon cannot distinguish the two.
+    ///   `lock` describes the byte range and lock type.
+    ///   Requires `FsOptions::POSIX_LOCKS` in `init`.
+    ///
+    /// `owner` identifies the lock owner. For POSIX locks, this is per-process. For OFD locks
+    /// and `flock()`, per open file description.
+    ///
+    /// This is the non-blocking variant. If the lock cannot be acquired, return
+    /// `EAGAIN`/`EWOULDBLOCK` (same value on Linux; the kernel translates as appropriate
+    /// for the guest syscall — `EWOULDBLOCK` for `flock()`, `EAGAIN` for `fcntl()`).
+    /// Implementations that do not support a particular lock type should return `ENOLCK`.
+    ///
+    /// # Required `FsOptions`
+    ///
+    /// | Guest syscall | `FsOptions` needed | `flags & LK_FLOCK` |
+    /// |---|---|---|
+    /// | `flock()` | `FLOCK_LOCKS` | set |
+    /// | `fcntl(F_SETLK)` | `POSIX_LOCKS` | not set |
+    /// | `fcntl(F_OFD_SETLK)` | `POSIX_LOCKS` | not set |
+    ///
+    /// If neither flag is set in `init`, the kernel handles locks locally inside the guest
+    /// without forwarding them. This is correct when only one VM accesses the volume
+    /// (including the default passthrough case). It is dangerous when multiple VMs share a
+    /// volume: the guest application sees no error, but locks silently have guest-local scope
+    /// only and are invisible to other VMs.
+    ///
+    /// # Error handling
+    ///
+    /// - `EAGAIN` / `EWOULDBLOCK` — lock conflict, cannot acquire now (non-blocking failure).
+    ///   Same value on Linux; the kernel translates as needed for the guest syscall.
+    /// - `ENOLCK` — rejects this request but the kernel continues forwarding future lock calls
+    ///   to the daemon. Use this to refuse lock types you don't support (e.g. accept `flock()`
+    ///   but reject `fcntl` byte-range locks).
+    /// - `ENOSYS` — the kernel treats it as a permanent failure and handles all subsequent lock
+    ///   calls locally inside the guest. This is safe when only one VM accesses the volume
+    ///   (including the default passthrough case), since the guest kernel's local lock manager
+    ///   is correct within a single VM. It is **dangerous** when multiple VMs share a volume:
+    ///   the guest application sees no error, but locks silently have guest-local scope only.
+    ///
+    /// # Lock cleanup
+    ///
+    /// When `FsOptions::FLOCK_LOCKS` is set, the `release` method receives `flock_release=true`
+    /// when the last file descriptor for an open file description is closed, indicating that
+    /// `flock()` locks associated with that `lock_owner` should be released. Additionally,
+    /// when `FsOptions::POSIX_LOCKS` is set, `flush` is called with the `lock_owner` on every
+    /// `close()`, and the file system should release POSIX locks for that owner.
+    fn setlk(
+        &self,
+        _ctx: Context,
+        _inode: Self::Inode,
+        _handle: Self::Handle,
+        _owner: u64,
+        _lock: fuse::FileLock,
+        _flags: u32,
+    ) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
-    /// TODO: support this
-    fn setlkw(&self) -> io::Result<()> {
+    /// Acquire an advisory lock, waiting if necessary.
+    ///
+    /// Like `setlk`, but the guest expects to block until the lock can be acquired. The same
+    /// `LK_FLOCK` flag distinguishes `flock()` from `fcntl()` locks (see `setlk` documentation
+    /// for details).
+    ///
+    /// # Blocking considerations
+    ///
+    /// The FUSE reply is coupled to this method's return value — there is no way to defer the
+    /// reply and send it later when the lock becomes available. This means any wait for the
+    /// lock blocks the calling worker thread. If enough concurrent `setlkw` calls block, the
+    /// worker thread pool is exhausted and all other filesystem operations for the guest stall.
+    ///
+    /// Truly non-blocking lock-wait support would require decoupling the FUSE reply from the
+    /// method return (see virtio-fs/virtiofsd#53), which is not yet supported.
+    ///
+    /// In practice, implementations typically perform a non-blocking attempt and return
+    /// `EAGAIN` on conflict. This is semantically incorrect (the guest asked for a blocking
+    /// call) but avoids thread pool starvation. Guest applications using `flock()` without
+    /// `LOCK_NB` will see an unexpected `EWOULDBLOCK`; those using `fcntl(F_SETLKW)` will
+    /// see an unexpected `EAGAIN`. Either may cause the application to retry or fail.
+    fn setlkw(
+        &self,
+        _ctx: Context,
+        _inode: Self::Inode,
+        _handle: Self::Handle,
+        _owner: u64,
+        _lock: fuse::FileLock,
+        _flags: u32,
+    ) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
