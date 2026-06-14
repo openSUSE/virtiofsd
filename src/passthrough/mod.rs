@@ -1111,6 +1111,12 @@ impl PassthroughFs {
             // would; which is to drop the "security.capability" xattr
             // on write
             Some(xattrname) => {
+                // No need to do anything for non-regular files.
+                let stat = statx(&fd, None)?.st;
+                if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+                    return Ok(());
+                }
+
                 let res = if o_path {
                     let proc_file_name = CString::new(format!("{fd}"))
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
