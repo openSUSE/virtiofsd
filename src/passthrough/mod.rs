@@ -576,7 +576,7 @@ impl PassthroughFs {
         // that the host kernel otherwise would if the xattrname was not mapped.
         let sec_xattr = unsafe { CStr::from_bytes_with_nul_unchecked(b"security.capability\0") };
         fs.cfg.xattr_security_capability = fs
-            .map_client_xattrname(sec_xattr)
+            .map_client_xattrname(sec_xattr, 0)
             .ok()
             .filter(|n| !sec_xattr.eq(n))
             .map(CString::from);
@@ -1045,22 +1045,37 @@ impl PassthroughFs {
         }
     }
 
-    fn block_xattr(&self, name: &[u8]) -> bool {
-        // Currently we only filter out posix acl xattrs.
-        // If acls are enabled, there is nothing to  filter.
-        if self.posix_acl.load(Ordering::Relaxed) {
-            return false;
-        }
-
-        let acl_access = "system.posix_acl_access".as_bytes();
-        let acl_default = "system.posix_acl_default".as_bytes();
-        acl_access.starts_with(name) || acl_default.starts_with(name)
-    }
-
-    fn map_client_xattrname<'a>(&self, name: &'a CStr) -> std::io::Result<Cow<'a, CStr>> {
-        if self.block_xattr(name.to_bytes()) {
+    fn check_blocked_xattr(&self, name: &[u8], uid: u32) -> io::Result<()> {
+        // Filter out anything that's not a standard Linux namespace.
+        if !name.starts_with("security.".as_bytes())
+            && !name.starts_with("system.".as_bytes())
+            && !name.starts_with("trusted.".as_bytes())
+            && !name.starts_with("user.".as_bytes())
+        {
             return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
         }
+
+        // Filter out POSIX ACL xattrs if not enabled.
+        if !self.posix_acl.load(Ordering::Relaxed)
+            && (name == "system.posix_acl_access".as_bytes()
+                || name == "system.posix_acl_default".as_bytes())
+        {
+            return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
+        }
+
+        // If not root, filter out trusted and security xattrs similar to what the kernel would
+        // do.
+        if uid != 0
+            && (name.starts_with("trusted.".as_bytes()) || name.starts_with("security.".as_bytes()))
+        {
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
+        }
+
+        Ok(())
+    }
+
+    fn map_client_xattrname<'a>(&self, name: &'a CStr, uid: u32) -> std::io::Result<Cow<'a, CStr>> {
+        self.check_blocked_xattr(name.to_bytes(), uid)?;
 
         match &self.cfg.xattrmap {
             Some(map) => match map.map_client_xattr(name).expect("unterminated mapping") {
@@ -1072,7 +1087,7 @@ impl PassthroughFs {
         }
     }
 
-    fn map_server_xattrlist(&self, xattr_names: Vec<u8>) -> Vec<u8> {
+    fn map_server_xattrlist(&self, xattr_names: Vec<u8>, uid: u32) -> Vec<u8> {
         let all_xattrs = match &self.cfg.xattrmap {
             Some(map) => map
                 .map_server_xattrlist(xattr_names)
@@ -1085,7 +1100,7 @@ impl PassthroughFs {
         let all_xattrs = all_xattrs.split(|b| *b == 0).filter(|bs| !bs.is_empty());
 
         for xattr in all_xattrs {
-            if !self.block_xattr(xattr) {
+            if self.check_blocked_xattr(xattr, uid).is_ok() {
                 filtered.extend_from_slice(xattr);
                 filtered.push(0);
             }
@@ -1111,6 +1126,12 @@ impl PassthroughFs {
             // would; which is to drop the "security.capability" xattr
             // on write
             Some(xattrname) => {
+                // No need to do anything for non-regular files.
+                let stat = statx(&fd, None)?.st;
+                if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+                    return Ok(());
+                }
+
                 let res = if o_path {
                     let proc_file_name = CString::new(format!("{fd}"))
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -1187,7 +1208,7 @@ impl PassthroughFs {
         // Set security context
         if let Some(secctx) = extensions.secctx {
             // Remap security xattr name.
-            let xattr_name = match self.map_client_xattrname(&secctx.name) {
+            let xattr_name = match self.map_client_xattrname(&secctx.name, ctx.uid) {
                 Ok(xattr_name) => xattr_name,
                 Err(e) => {
                     unsafe {
@@ -1222,9 +1243,10 @@ impl PassthroughFs {
         parent_file: &InodeFile,
         name: &CStr,
         secctx: &SecContext,
+        uid: u32,
     ) -> io::Result<()> {
         // Remap security xattr name.
-        let xattr_name = self.map_client_xattrname(&secctx.name)?;
+        let xattr_name = self.map_client_xattrname(&secctx.name, uid)?;
 
         // Set security context on newly created node. It could be
         // device node as well, so it is not safe to open the node
@@ -1669,7 +1691,8 @@ impl FileSystem for PassthroughFs {
 
         // Set security context on dir.
         if let Some(secctx) = extensions.secctx {
-            if let Err(e) = self.do_mknod_mkdir_symlink_secctx(&parent_file, name, &secctx) {
+            if let Err(e) = self.do_mknod_mkdir_symlink_secctx(&parent_file, name, &secctx, ctx.uid)
+            {
                 unsafe {
                     libc::unlinkat(parent_file.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
                 };
@@ -2122,7 +2145,8 @@ impl FileSystem for PassthroughFs {
 
         // Set security context on node.
         if let Some(secctx) = extensions.secctx {
-            if let Err(e) = self.do_mknod_mkdir_symlink_secctx(&parent_file, name, &secctx) {
+            if let Err(e) = self.do_mknod_mkdir_symlink_secctx(&parent_file, name, &secctx, ctx.uid)
+            {
                 unsafe {
                     libc::unlinkat(parent_file.as_raw_fd(), name.as_ptr(), 0);
                 };
@@ -2197,7 +2221,8 @@ impl FileSystem for PassthroughFs {
 
         // Set security context on symlink.
         if let Some(secctx) = extensions.secctx {
-            if let Err(e) = self.do_mknod_mkdir_symlink_secctx(&parent_file, name, &secctx) {
+            if let Err(e) = self.do_mknod_mkdir_symlink_secctx(&parent_file, name, &secctx, ctx.uid)
+            {
                 unsafe {
                     libc::unlinkat(parent_file.as_raw_fd(), name.as_ptr(), 0);
                 };
@@ -2346,7 +2371,7 @@ impl FileSystem for PassthroughFs {
 
     fn setxattr(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         name: &CStr,
         value: &[u8],
@@ -2358,7 +2383,7 @@ impl FileSystem for PassthroughFs {
         }
 
         let data = self.inodes.get(inode).ok_or_else(ebadf)?;
-        let name = self.map_client_xattrname(name)?;
+        let name = self.map_client_xattrname(name, ctx.uid)?;
 
         // If we are setting posix access acl and if SGID needs to be
         // cleared. Let's do it explicitly by calling a chmod() syscall.
@@ -2423,7 +2448,7 @@ impl FileSystem for PassthroughFs {
 
     fn getxattr(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         name: &CStr,
         size: u32,
@@ -2434,7 +2459,7 @@ impl FileSystem for PassthroughFs {
 
         let mut buf = vec![0; size as usize];
 
-        let name = self.map_client_xattrname(name).map_err(|e| {
+        let name = self.map_client_xattrname(name, ctx.uid).map_err(|e| {
             if e.kind() == ErrorKind::PermissionDenied {
                 io::Error::from_raw_os_error(libc::ENODATA)
             } else {
@@ -2488,7 +2513,7 @@ impl FileSystem for PassthroughFs {
         }
     }
 
-    fn listxattr(&self, _ctx: Context, inode: Inode, size: u32) -> io::Result<ListxattrReply> {
+    fn listxattr(&self, ctx: Context, inode: Inode, size: u32) -> io::Result<ListxattrReply> {
         if !self.cfg.xattr {
             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
         }
@@ -2534,18 +2559,18 @@ impl FileSystem for PassthroughFs {
             Ok(ListxattrReply::Count(res as u32))
         } else {
             buf.resize(res as usize, 0);
-            let buf = self.map_server_xattrlist(buf);
+            let buf = self.map_server_xattrlist(buf, ctx.uid);
             Ok(ListxattrReply::Names(buf))
         }
     }
 
-    fn removexattr(&self, _ctx: Context, inode: Inode, name: &CStr) -> io::Result<()> {
+    fn removexattr(&self, ctx: Context, inode: Inode, name: &CStr) -> io::Result<()> {
         if !self.cfg.xattr {
             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
         }
 
         let data = self.inodes.get(inode).ok_or_else(ebadf)?;
-        let name = self.map_client_xattrname(name)?;
+        let name = self.map_client_xattrname(name, ctx.uid)?;
 
         let res = if is_safe_inode(data.mode) {
             // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
