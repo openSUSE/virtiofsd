@@ -1557,8 +1557,7 @@ impl FileSystem for PassthroughFs {
                 self.posix_acl.store(true, Ordering::Relaxed);
                 debug!("init: enabling posix acl");
             } else {
-                error!("Cannot enable posix ACLs, client does not support it");
-                return Err(io::Error::from_raw_os_error(libc::EPROTO));
+                warn!("Cannot enable posix ACLs, client does not support it");
             }
         }
 
