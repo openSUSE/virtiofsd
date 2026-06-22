@@ -46,13 +46,12 @@ impl TryFrom<serialized::PassthroughFs> for Vec<u8> {
     }
 }
 
-impl From<&PassthroughFs> for serialized::PassthroughFsV2 {
-    /// Serialize `fs`, assuming it has been prepared for serialization (i.e. all inodes must have
-    /// their migration info set)
-    fn from(fs: &PassthroughFs) -> Self {
-        let handles_map = fs.handles.read().unwrap();
+/// Serialize `fs`, assuming it has been prepared for serialization (i.e. all inodes must have
+/// their migration info set)
+pub(crate) fn serialize_state(fs: &PassthroughFs) -> serialized::PassthroughFsV2 {
+    let handles_map = fs.handles.read().unwrap();
 
-        let inodes: Vec<serialized::Inode> = fs.inodes.iter().map(|inode| {
+    let inodes: Vec<serialized::Inode> = fs.inodes.iter().map(|inode| {
             inode
                 .as_ref()
                 .as_serialized(fs)
@@ -70,39 +69,36 @@ impl From<&PassthroughFs> for serialized::PassthroughFsV2 {
                 })
         }).collect();
 
-        let mount_paths = if fs.cfg.migration_mode == MigrationMode::FileHandles {
-            match MountPathsBuilder::new(fs) {
-                Ok(mpb) => mpb.build(inodes.iter()),
-                Err(err) => {
-                    warn!(
-                        "Cannot collect mount points: {err}; will not be able to migrate any inodes"
-                    );
-                    HashMap::new()
-                }
+    let mount_paths = if fs.cfg.migration_mode == MigrationMode::FileHandles {
+        match MountPathsBuilder::new(fs) {
+            Ok(mpb) => mpb.build(inodes.iter()),
+            Err(err) => {
+                warn!("Cannot collect mount points: {err}; will not be able to migrate any inodes");
+                HashMap::new()
             }
-        } else {
-            // No need for mount paths outside of file-handles migration mode
-            HashMap::new()
-        };
-
-        let handles = handles_map
-            .iter()
-            .map(|(handle, data)| (*handle, data.as_ref()).into())
-            .collect();
-
-        serialized::PassthroughFsV2 {
-            v1: serialized::PassthroughFsV1 {
-                inodes,
-                next_inode: fs.next_inode.load(Ordering::Relaxed),
-
-                handles,
-                next_handle: fs.next_handle.load(Ordering::Relaxed),
-
-                negotiated_opts: fs.into(),
-            },
-
-            mount_paths,
         }
+    } else {
+        // No need for mount paths outside of file-handles migration mode
+        HashMap::new()
+    };
+
+    let handles = handles_map
+        .iter()
+        .map(|(handle, data)| (*handle, data.as_ref()).into())
+        .collect();
+
+    serialized::PassthroughFsV2 {
+        v1: serialized::PassthroughFsV1 {
+            inodes,
+            next_inode: fs.next_inode.load(Ordering::Relaxed),
+
+            handles,
+            next_handle: fs.next_handle.load(Ordering::Relaxed),
+
+            negotiated_opts: fs.into(),
+        },
+
+        mount_paths,
     }
 }
 
