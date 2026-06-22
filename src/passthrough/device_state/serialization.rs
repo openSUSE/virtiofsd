@@ -84,6 +84,9 @@ pub(crate) fn serialize_state(fs: &PassthroughFs) -> serialized::PassthroughFsV2
 
     let handles = handles_map
         .iter()
+        .inspect(|(handle, data)| {
+            fsync_handle(**handle, data);
+        })
         .map(|(handle, data)| (*handle, data.as_ref()).into())
         .collect();
 
@@ -99,6 +102,26 @@ pub(crate) fn serialize_state(fs: &PassthroughFs) -> serialized::PassthroughFsV2
         },
 
         mount_paths,
+    }
+}
+
+fn fsync_handle(handle_id: Handle, handle_data: &HandleData) {
+    let Ok(file) = handle_data.file.get() else {
+        return; // Invalid handle, nothing to do
+    };
+
+    let HandleMigrationInfo::OpenInode { flags } = &handle_data.migration_info;
+    if (flags & libc::O_ACCMODE) == libc::O_RDONLY {
+        return;
+    }
+
+    let file = file.read().unwrap();
+    // Best-effort: the guest is unaware of migration, so dirty data is expected
+    if let Err(err) = file.get_file().sync_all() {
+        warn!(
+            "fsync failed for handle {} (inode {}): {err}",
+            handle_id, handle_data.inode
+        );
     }
 }
 
