@@ -9,8 +9,6 @@ use std::mem::size_of;
 use std::ops::{Deref, DerefMut};
 use std::os::unix::io::AsRawFd;
 
-use log::debug;
-
 use vm_memory::ByteValued;
 
 #[repr(C, packed)]

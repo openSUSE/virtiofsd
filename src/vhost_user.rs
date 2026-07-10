@@ -10,7 +10,6 @@ use std::thread::{self, JoinHandle};
 use std::{convert, error, fmt, io, process};
 
 use futures::executor::{ThreadPool, ThreadPoolBuilder};
-use log::*;
 
 use vhost::vhost_user::message::*;
 use vhost::vhost_user::Backend;
