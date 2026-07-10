@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 #[macro_use]
-extern crate log;
+extern crate tracing;
 
 pub mod descriptor_utils;
 pub mod file_traits;

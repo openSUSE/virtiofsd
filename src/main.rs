@@ -4,7 +4,6 @@
 
 mod logging;
 
-use log::*;
 use passthrough::xattrmap::XattrMap;
 use std::collections::HashSet;
 use std::convert::TryFrom;
@@ -15,6 +14,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{cmp, process};
+use tracing::level_filters::LevelFilter;
+use tracing::{error, info, warn};
 use virtiofsd::idmap::{GidMap, UidMap};
 
 use clap::{CommandFactory, Parser};
@@ -452,10 +453,10 @@ fn parse_compat(opt: Opt) -> Opt {
                 _ => value_error("cache", value),
             },
             ["loglevel", value] => match value {
-                "debug" => opt.log_level = LevelFilter::Debug,
-                "info" => opt.log_level = LevelFilter::Info,
-                "warn" => opt.log_level = LevelFilter::Warn,
-                "err" => opt.log_level = LevelFilter::Error,
+                "debug" => opt.log_level = LevelFilter::DEBUG,
+                "info" => opt.log_level = LevelFilter::INFO,
+                "warn" => opt.log_level = LevelFilter::WARN,
+                "err" => opt.log_level = LevelFilter::ERROR,
                 _ => value_error("loglevel", value),
             },
             ["sandbox", value] => match value {
