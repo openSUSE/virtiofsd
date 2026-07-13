@@ -14,7 +14,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{cmp, process};
-use tracing::level_filters::LevelFilter;
 use tracing::{error, info, warn};
 use virtiofsd::idmap::{GidMap, UidMap};
 
@@ -242,9 +241,9 @@ struct Opt {
     #[arg(long)]
     modcaps: Option<String>,
 
-    /// Log level (error, warn, info, debug, trace, off)
-    #[arg(long = "log-level", default_value = "info")]
-    log_level: LevelFilter,
+    /// Log level or tracing filter directive (error, warn, info, debug, trace, off)
+    #[arg(long = "log-level", default_value = "info", value_parser = logging::parse_log_level)]
+    log_level: String,
 
     /// Log to syslog [default: stderr]
     #[arg(long)]
@@ -453,10 +452,8 @@ fn parse_compat(opt: Opt) -> Opt {
                 _ => value_error("cache", value),
             },
             ["loglevel", value] => match value {
-                "debug" => opt.log_level = LevelFilter::DEBUG,
-                "info" => opt.log_level = LevelFilter::INFO,
-                "warn" => opt.log_level = LevelFilter::WARN,
-                "err" => opt.log_level = LevelFilter::ERROR,
+                "debug" | "info" | "warn" => opt.log_level = value.to_string(),
+                "err" => opt.log_level = "error".to_string(),
                 _ => value_error("loglevel", value),
             },
             ["sandbox", value] => match value {

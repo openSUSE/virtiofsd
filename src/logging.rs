@@ -7,6 +7,18 @@ use tracing_subscriber::{layer, EnvFilter, Layer};
 
 use crate::Opt;
 
+// Best effort to validate the --log-level string, it can reject some
+// valid but unrealistic filters like "virtiofsd::passthrough"
+pub(super) fn parse_log_level(s: &str) -> Result<String, String> {
+    if !s.contains('=') && !s.contains(',') && s.parse::<LevelFilter>().is_err() {
+        return Err(format!("invalid log-level value: {s}"));
+    }
+
+    EnvFilter::try_new(s)
+        .map(|_| s.to_string())
+        .map_err(|e| format!("invalid log-level value: {e}"))
+}
+
 struct SyslogLayer;
 impl SyslogLayer {
     fn new() -> Self {
@@ -94,13 +106,13 @@ pub(super) fn initialize_logging(opt: &Opt) {
     use tracing_subscriber::prelude::*;
 
     let log_level = if opt.compat_debug {
-        LevelFilter::DEBUG
+        LevelFilter::DEBUG.to_string()
     } else {
-        opt.log_level
+        opt.log_level.clone()
     };
 
     let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level.to_string()));
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
 
     if opt.syslog {
         tracing_subscriber::registry()

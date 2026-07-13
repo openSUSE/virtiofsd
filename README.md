@@ -218,7 +218,12 @@ File descriptor for the listening (not yet connected) socket.
 ```shell
 --log-level <log-level>
 ```
-Log level (error, warn, info, debug, trace, off).
+Log level or filter directive (error, warn, info, debug, trace, off).
+Supports per-target filtering using `target=level` directives separated
+by commas, e.g., `warn,virtiofsd::passthrough=debug`. The `RUST_LOG`
+environment variable takes precedence.
+
+See the [tracing directives documentation](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html#directives) for the full syntax.
 
 Default: info.
 
