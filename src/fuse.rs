@@ -614,10 +614,11 @@ impl Attr {
         GidMap: FnOnce(HostGid) -> io::Result<GuestGid>,
     >(
         st: libc::stat64,
+        mode: u32,
         uid_map: UidMap,
         gid_map: GidMap,
     ) -> io::Result<Attr> {
-        Attr::try_with_flags(st, 0, uid_map, gid_map)
+        Attr::try_with_flags(st, mode, 0, uid_map, gid_map)
     }
 
     /**
@@ -630,6 +631,7 @@ impl Attr {
         GidMap: FnOnce(HostGid) -> io::Result<GuestGid>,
     >(
         st: libc::stat64,
+        mode: u32,
         flags: u32,
         uid_map: UidMap,
         gid_map: GidMap,
@@ -647,7 +649,7 @@ impl Attr {
             atimensec: st.st_atime_nsec as u32,
             mtimensec: st.st_mtime_nsec as u32,
             ctimensec: st.st_ctime_nsec as u32,
-            mode: st.st_mode,
+            mode,
             nlink: st.st_nlink as u32,
             uid,
             gid,

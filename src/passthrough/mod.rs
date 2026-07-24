@@ -8,6 +8,7 @@ pub mod file_handle;
 mod guest_fd_limit;
 pub mod inode_store;
 pub mod mount_fd;
+mod phony;
 pub mod read_only;
 pub mod stat;
 pub mod util;
@@ -43,6 +44,7 @@ use std::fs::File;
 use std::io;
 use std::io::ErrorKind;
 use std::mem::MaybeUninit;
+use std::os::fd::AsFd;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -449,6 +451,9 @@ pub struct Config {
     ///
     /// The default is `u64::MAX`.
     pub guest_fd_limit: u64,
+
+    /// Replace special files in the host
+    pub phony_special_files: bool,
 }
 
 impl Default for Config {
@@ -481,6 +486,7 @@ impl Default for Config {
             uid_map: None,
             gid_map: None,
             guest_fd_limit: u64::MAX,
+            phony_special_files: false,
         }
     }
 }
@@ -964,8 +970,15 @@ impl PassthroughFs {
             self.inodes.get_or_insert(inode_data)?
         };
 
+        let mode = if self.cfg.phony_special_files {
+            phony::mode(st.st.st_mode)
+        } else {
+            st.st.st_mode
+        };
+
         let attr = fuse::Attr::try_with_flags(
             st.st,
+            mode,
             attr_flags,
             |uid| self.map_host_uid(uid),
             |gid| self.map_host_gid(gid),
@@ -1069,8 +1082,16 @@ impl PassthroughFs {
         let data = self.inodes.get(inode).ok_or_else(ebadf)?;
         let inode_file = data.get_file()?;
         let st = statx(&inode_file, None)?.st;
+
+        let mode = if self.cfg.phony_special_files {
+            phony::mode(st.st_mode)
+        } else {
+            st.st_mode
+        };
+
         let attr = fuse::Attr::try_from_stat64(
             st,
+            mode,
             |uid| self.map_host_uid(uid),
             |gid| self.map_host_gid(gid),
         )?;
@@ -1096,15 +1117,14 @@ impl PassthroughFs {
     }
 
     fn block_xattr(&self, name: &[u8]) -> bool {
-        // Currently we only filter out posix acl xattrs.
-        // If acls are enabled, there is nothing to  filter.
-        if self.posix_acl.load(Ordering::Relaxed) {
-            return false;
-        }
-
         let acl_access = "system.posix_acl_access".as_bytes();
         let acl_default = "system.posix_acl_default".as_bytes();
-        acl_access.starts_with(name) || acl_default.starts_with(name)
+
+        let acl = !self.posix_acl.load(Ordering::Relaxed)
+            && (acl_access.starts_with(name) || acl_default.starts_with(name));
+
+        // FIXME: don't the phony xattr unconditionally (?)
+        acl || phony::block_xattr(name)
     }
 
     fn map_client_xattrname<'a>(&self, name: &'a CStr) -> std::io::Result<Cow<'a, CStr>> {
@@ -1996,6 +2016,10 @@ impl FileSystem for PassthroughFs {
         };
 
         if valid.contains(SetattrValid::MODE) {
+            if self.cfg.phony_special_files && phony::is_phony(attr.mode) {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
+
             // Safe because this doesn't modify any memory and we check the return value.
             let res = unsafe {
                 match data {
@@ -2256,6 +2280,20 @@ impl FileSystem for PassthroughFs {
         let data = self.inodes.get(parent).ok_or_else(ebadf)?;
         let parent_file = data.get_file()?;
 
+        if self.cfg.phony_special_files {
+            let fd = self.do_create(
+                &ctx,
+                &parent_file,
+                name,
+                phony::HOST_SYMLINK_MODE,
+                0,
+                0,
+                extensions,
+            )?;
+            phony::symlink(fd, linkname)?;
+            return self.do_lookup(parent, name);
+        }
+
         let invalidated_inode = self.before_invalidating_path(&data, name);
         let res = {
             let _credentials_guard = self.unix_credentials_guard(&ctx, &extensions)?;
@@ -2287,6 +2325,13 @@ impl FileSystem for PassthroughFs {
     fn readlink(&self, _ctx: Context, inode: Inode) -> io::Result<Vec<u8>> {
         let data = self.inodes.get(inode).ok_or_else(ebadf)?;
         let inode_file = data.get_file()?;
+
+        if self.cfg.phony_special_files && phony::is_phony(data.mode) {
+            // we need to reopen the file because we cannot read the xattr from a `O_PATH` fd
+            let file = self.open_inode(inode, libc::O_RDONLY | libc::O_NONBLOCK)?;
+            let flink = phony::readlink(file.as_fd())?;
+            return Ok(flink);
+        }
 
         let mut buf = vec![0; libc::PATH_MAX as usize];
 

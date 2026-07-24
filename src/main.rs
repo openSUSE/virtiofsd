@@ -414,6 +414,16 @@ struct Opt {
     /// This parameter is ignored on the destination side.
     #[arg(long = "migration-confirm-paths")]
     migration_confirm_paths: bool,
+
+    /// Make special files to be backed by regular files in the host.
+    ///
+    /// This is especially useful when running virtiofsd without privileges and prefixing all
+    /// xattrs with “user.”, for example using
+    /// `--xattrmap=":prefix:all::user.virtiofs.::bad:all:::"`
+    ///
+    /// Currently, only sylinks are supported.
+    #[arg(long = "phony-special-files")]
+    phony_special_files: bool,
 }
 
 fn parse_compat(opt: Opt) -> Opt {
@@ -865,6 +875,7 @@ fn main() {
         uid_map: Some(opt.translate_uid),
         gid_map: Some(opt.translate_gid),
         guest_fd_limit,
+        phony_special_files: opt.phony_special_files,
         ..Default::default()
     };
 
