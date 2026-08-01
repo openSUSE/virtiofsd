@@ -134,10 +134,17 @@ pub fn statx(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<StatExt> {
 
         // if `statx()` doesn't provide the mount id (before kernel 5.8),
         // let's try `name_to_handle_at()`, if everything fails just use 0
-        let mnt_id = stx
-            .mount_id()
-            .or_else(|| get_mount_id(dir, path))
-            .unwrap_or(0);
+        //
+        // If the file is a UDS socket, ignore the mount id since otherwise if
+        // it was bind mounted somewhere else, the guest kernel would see them
+        // as two different sockets, causing connection errors.
+        let mnt_id = if (stx.stat64().unwrap().st_mode & libc::S_IFMT == libc::S_IFSOCK) {
+            0
+        } else {
+            stx.mount_id()
+                .or_else(|| get_mount_id(dir, path))
+                .unwrap_or(0)
+        };
 
         Ok(StatExt {
             st: stx
