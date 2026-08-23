@@ -10,9 +10,9 @@ use std::ops::Deref;
 use std::ptr::copy_nonoverlapping;
 use std::{cmp, result};
 
-use vhost_user_backend::bitmap::BitmapMmapRegion;
 use virtio_queue::DescriptorChain;
-use vm_memory::bitmap::{Bitmap, BitmapSlice};
+use vm_memory::bitmap::{Bitmap, BitmapSlice, WithBitmapSlice};
+
 use vm_memory::{
     Address, ByteValued, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
     VolatileMemory, VolatileMemoryError, VolatileSlice,
@@ -185,11 +185,11 @@ impl<'a, B: BitmapSlice> DescriptorChainConsumer<'a, B> {
 /// Reader will skip iterating over descriptor chain when first writable
 /// descriptor is encountered.
 #[derive(Clone)]
-pub struct Reader<'a, B = BitmapMmapRegion> {
-    buffer: DescriptorChainConsumer<'a, B>,
+pub struct Reader<'a, B: Bitmap> {
+    buffer: DescriptorChainConsumer<'a, <B as WithBitmapSlice<'a>>::S>,
 }
 
-impl<'a, B: Bitmap + BitmapSlice + 'static> Reader<'a, B> {
+impl<'a, B: Bitmap + 'static> Reader<'a, B> {
     /// Construct a new Reader wrapper over `desc_chain`.
     pub fn new<M>(
         mem: &'a GuestMemoryMmap<B>,
@@ -222,7 +222,7 @@ impl<'a, B: Bitmap + BitmapSlice + 'static> Reader<'a, B> {
                     .get_slice(offset.raw_value() as usize, desc.len() as usize)
                     .map_err(Error::VolatileMemoryError)
             })
-            .collect::<Result<VecDeque<VolatileSlice<'a, B>>>>()?;
+            .collect::<Result<VecDeque<VolatileSlice<'a, <B as WithBitmapSlice<'a>>::S>>>>()?;
         Ok(Reader {
             buffer: DescriptorChainConsumer {
                 buffers,
@@ -253,7 +253,7 @@ impl<'a, B: Bitmap + BitmapSlice + 'static> Reader<'a, B> {
     /// Return the number of bytes written.  This can be less than `count` if there isn't enough
     /// data in the descriptor chain buffer, or if the file’s write function performed a short
     /// write.
-    pub fn write_to_file_at<F: FileReadWriteAtVolatile<B>>(
+    pub fn write_to_file_at<F: FileReadWriteAtVolatile<<B as WithBitmapSlice<'a>>::S>>(
         &mut self,
         dst: F,
         count: usize,
@@ -285,7 +285,7 @@ impl<'a, B: Bitmap + BitmapSlice + 'static> Reader<'a, B> {
     }
 }
 
-impl<B: BitmapSlice> io::Read for Reader<'_, B> {
+impl<B: Bitmap> io::Read for Reader<'_, B> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.buffer.consume(buf.len(), |bufs| {
             let mut rem = buf;
@@ -316,11 +316,11 @@ impl<B: BitmapSlice> io::Read for Reader<'_, B> {
 /// Writer will start iterating the descriptors from the first writable one and will
 /// assume that all following descriptors are writable.
 #[derive(Clone)]
-pub struct Writer<'a, B = BitmapMmapRegion> {
-    buffer: DescriptorChainConsumer<'a, B>,
+pub struct Writer<'a, B: Bitmap> {
+    buffer: DescriptorChainConsumer<'a, <B as WithBitmapSlice<'a>>::S>,
 }
 
-impl<'a, B: Bitmap + BitmapSlice + 'static> Writer<'a, B> {
+impl<'a, B: Bitmap + 'static> Writer<'a, B> {
     /// Construct a new Writer wrapper over `desc_chain`.
     pub fn new<M>(
         mem: &'a GuestMemoryMmap<B>,
@@ -353,7 +353,7 @@ impl<'a, B: Bitmap + BitmapSlice + 'static> Writer<'a, B> {
                     .get_slice(offset.raw_value() as usize, desc.len() as usize)
                     .map_err(Error::VolatileMemoryError)
             })
-            .collect::<Result<VecDeque<VolatileSlice<'a, B>>>>()?;
+            .collect::<Result<VecDeque<VolatileSlice<'a, <B as WithBitmapSlice<'a>>::S>>>>()?;
 
         Ok(Writer {
             buffer: DescriptorChainConsumer {
@@ -378,7 +378,7 @@ impl<'a, B: Bitmap + BitmapSlice + 'static> Writer<'a, B> {
     ///
     /// Return the number of bytes read.  This can be less than `count` if there isn't enough data
     /// in the descriptor chain buffer, or if the file’s read function performed a short read.
-    pub fn read_from_file_at<F: FileReadWriteAtVolatile<B>>(
+    pub fn read_from_file_at<F: FileReadWriteAtVolatile<<B as WithBitmapSlice<'a>>::S>>(
         &mut self,
         src: F,
         count: usize,
@@ -404,7 +404,7 @@ impl<'a, B: Bitmap + BitmapSlice + 'static> Writer<'a, B> {
     }
 }
 
-impl<B: BitmapSlice> io::Write for Writer<'_, B> {
+impl<B: Bitmap> io::Write for Writer<'_, B> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.buffer.consume(buf.len(), |bufs| {
             let mut rem = buf;

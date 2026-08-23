@@ -15,13 +15,11 @@ pub mod macros;
 pub mod oslib;
 pub mod passthrough;
 pub mod read_dir;
-pub mod sandbox;
 #[cfg(feature = "seccomp")]
 pub mod seccomp;
 pub mod server;
 pub mod soft_idmap;
 pub mod util;
-pub mod vhost_user;
 
 use std::ffi::{FromBytesWithNulError, FromVecWithNulError};
 use std::{error, fmt, io};

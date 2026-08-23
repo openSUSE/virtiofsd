@@ -29,11 +29,11 @@ use vmm_sys_util::event::{
     new_event_consumer_and_notifier, EventConsumer, EventFlag, EventNotifier,
 };
 
-use crate::descriptor_utils::{Error as VufDescriptorError, Reader, Writer};
-use crate::filesystem::{FileSystem, SerializableFileSystem};
-use crate::server::Server;
-use crate::util::other_io_error;
-use crate::Error as VhostUserFsError;
+use virtiofsd::descriptor_utils::{Error as VufDescriptorError, Reader, Writer};
+use virtiofsd::filesystem::{FileSystem, SerializableFileSystem};
+use virtiofsd::server::Server;
+use virtiofsd::util::other_io_error;
+use virtiofsd::Error as VhostUserFsError;
 
 type LoggedMemory = GuestMemoryMmap<BitmapMmapRegion>;
 type LoggedMemoryAtomic = GuestMemoryAtomic<LoggedMemory>;
