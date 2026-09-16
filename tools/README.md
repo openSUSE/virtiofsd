@@ -5,16 +5,19 @@ The host needs only the container engine; Rust and development packages stay ins
 
 ```bash
 ./tools/dev-container.sh
-./tools/dev-container.sh cargo test --locked --target x86_64-unknown-linux-musl mount_fd::tests
+./tools/dev-container.sh cargo test --locked mount_fd::tests
 ./tools/dev-container.sh cargo fmt -- --check
 ./tools/dev-container.sh cargo clippy --locked -- -Dwarnings -Aclippy::manual-c-str-literals
-./tools/dev-container.sh cargo build --locked --release --target x86_64-unknown-linux-musl
+./tools/dev-container.sh cargo build --locked --release
 ```
 
-The default command runs the complete test suite on x86_64, matching CI.
+The default command runs the complete test suite for the container's native Rust target, detected with `rustc --print host-tuple`.
+This selects `x86_64-unknown-linux-musl` on x86_64 or `aarch64-unknown-linux-musl` on aarch64.
+The target is set explicitly through `CARGO_BUILD_TARGET` so static-link flags do not affect host-side procedural macros.
 The container runs as the invoking user's UID/GID so generated files remain user-owned.
 Downloads and build artifacts remain under `target/container-cargo` and `target/container-build` in this checkout.
-The release binary is `target/container-build/x86_64-unknown-linux-musl/release/virtiofsd`.
+The release binary is `target/container-build/<target>/release/virtiofsd`.
+Run `./tools/dev-container.sh rustc --print host-tuple` to see the detected target.
 Set `VIRTIOFSD_DEV_IMAGE` to change the local image name.
 Run Git on the host when using a linked worktree, since its shared Git directory is outside the container's checkout mount.
 

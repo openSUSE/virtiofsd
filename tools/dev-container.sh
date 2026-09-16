@@ -11,7 +11,7 @@ if [[ ${engine##*/} == podman ]]; then
 fi
 
 if [[ $# == 0 ]]; then
-    set -- cargo test --locked --target x86_64-unknown-linux-musl
+    set -- cargo test --locked
 fi
 
 "$engine" build -t "$image" -f "$repo_dir/tools/Dockerfile" "$repo_dir/tools"
