@@ -391,7 +391,7 @@ impl MountFds {
         };
 
         let path = mountinfo.split('\n').find_map(|line| {
-            let mut columns = line.split(char::is_whitespace);
+            let mut columns = line.split(' ');
 
             if columns.next()?.parse::<MountId>().ok()? != mount_id {
                 return None;
@@ -404,7 +404,13 @@ impl MountFds {
 
         match path {
             Some(p) => {
-                let p = String::from(p);
+                // mountinfo escapes spaces, tabs, newlines, and backslashes in paths.
+                // Decode backslashes last so a literal "\040" is not decoded a second time.
+                let p = p
+                    .replace("\\040", " ")
+                    .replace("\\011", "\t")
+                    .replace("\\012", "\n")
+                    .replace("\\134", "\\");
                 if let Some(prefix) = self.mountprefix.as_ref() {
                     if let Some(suffix) = p.strip_prefix(prefix).filter(|s| !s.is_empty()) {
                         Ok(suffix.into())
@@ -463,5 +469,135 @@ impl MountFds {
                 err
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::passthrough::util::reopen_fd_through_proc;
+    use std::fs;
+    use std::io::Write;
+    use vmm_sys_util::tempdir::TempDir;
+    use vmm_sys_util::tempfile::TempFile;
+
+    /// Back a mount table with a temporary file, just like the seekable proc file.
+    fn mount_fds(contents: &str, prefix: Option<&str>) -> MountFds {
+        let mountinfo = TempFile::new().unwrap();
+        mountinfo.as_file().write_all(contents.as_bytes()).unwrap();
+        MountFds::new(
+            mountinfo.as_file().try_clone().unwrap(),
+            prefix.map(String::from),
+        )
+    }
+
+    /// Select the mount-point column and decode exactly the escapes emitted by Linux.
+    #[test]
+    fn mount_root_decodes_paths() {
+        let cases = [
+            ("/plain", "/plain"),
+            (r"/mount\040with\040spaces", "/mount with spaces"),
+            (r"/tab\011name", "/tab\tname"),
+            (r"/line\012name", "/line\nname"),
+            (r"/back\134slash", r"/back\slash"),
+            (
+                r"/literal\134040\134011\134012\134134",
+                r"/literal\040\011\012\134",
+            ),
+            (r"/mixed\040\011\012\134\134040", "/mixed \t\n\\\\040"),
+            (r"/trailing\134", "/trailing\\"),
+            (
+                "/日本語/white\u{a0}space\rname",
+                "/日本語/white\u{a0}space\rname",
+            ),
+        ];
+        for (encoded, decoded) in cases {
+            let mounts = mount_fds(
+                &format!(
+                    "10 1 8:1 / /other rw - ext4 /dev/root rw\n\
+                     42 10 8:2 /different\\040root {encoded} rw shared:1 - ext4 /dev/data rw\n"
+                ),
+                None,
+            );
+            assert_eq!(mounts.get_mount_root(42).unwrap(), decoded, "{encoded}");
+            // Each lookup must rewind the table, including after reading another mount.
+            assert_eq!(mounts.get_mount_root(10).unwrap(), "/other");
+            assert_eq!(mounts.get_mount_root(42).unwrap(), decoded);
+        }
+    }
+
+    /// Decode before matching the host prefix used by chroot sandboxing.
+    #[test]
+    fn mount_root_strips_decoded_prefix() {
+        for (encoded, prefix, expected) in [
+            (
+                r"/share\040dir/child\040mount",
+                "/share dir",
+                "/child mount",
+            ),
+            (r"/share\134040/child\134040", r"/share\040", r"/child\040"),
+            (r"/share\040dir", "/share dir", "/"),
+            ("/", "/share dir", "/"),
+            ("/outside", "/share dir", "/"),
+        ] {
+            let mounts = mount_fds(
+                &format!("42 1 8:1 / {encoded} rw - ext4 /dev/root rw\n"),
+                Some(prefix),
+            );
+            assert_eq!(mounts.get_mount_root(42).unwrap(), expected);
+        }
+    }
+
+    /// Missing IDs and incomplete entries keep returning EINVAL.
+    #[test]
+    fn mount_root_requires_matching_entry() {
+        for table in [
+            "",
+            "42 1 8:1 /",
+            "43 1 8:1 / /other rw - ext4 /dev/root rw\n",
+        ] {
+            let error = mount_fds(table, None).get_mount_root(42).unwrap_err();
+            assert_eq!(error.into_inner().raw_os_error(), Some(libc::EINVAL));
+        }
+    }
+
+    /// Exercise open, statx, and reopen against a real path without requiring mount privileges.
+    #[test]
+    fn get_opens_decoded_mount_path() {
+        let directory = TempDir::new_with_prefix("/tmp/virtiofsd_mount_fd_").unwrap();
+        let path = directory.as_path().join("mount \t\n\\040");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("probe"), b"mounted data").unwrap();
+        let expected = statx(&File::open(&path).unwrap(), None).unwrap();
+        let encoded = format!(
+            "{}/mount\\040\\011\\012\\134040",
+            directory.as_path().display()
+        );
+        let mounts = mount_fds(
+            &format!(
+                "{} 1 8:1 / {encoded} rw - ext4 /dev/root rw\n",
+                expected.mnt_id
+            ),
+            None,
+        );
+        let proc_self_fd = File::open("/proc/self/fd").unwrap();
+        let mount = mounts
+            .get(expected.mnt_id, |fd, flags| {
+                reopen_fd_through_proc(&fd, flags, &proc_self_fd)
+            })
+            .unwrap();
+        let actual = statx(mount.file(), None).unwrap();
+        assert_eq!(actual.mnt_id, expected.mnt_id);
+        assert_eq!(actual.st.st_ino, expected.st.st_ino);
+        let mut data = String::new();
+        openat(mount.file(), "probe", libc::O_RDONLY)
+            .unwrap()
+            .read_to_string(&mut data)
+            .unwrap();
+        assert_eq!(data, "mounted data");
+        let cached = mounts
+            .get(expected.mnt_id, |_, _| panic!("mount already cached"))
+            .unwrap();
+        assert!(Arc::ptr_eq(&mount, &cached));
     }
 }
