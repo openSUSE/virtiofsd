@@ -2,6 +2,9 @@
 //
 // SPDX-License-Identifier: (Apache-2.0 AND BSD-3-Clause)
 
+pub mod sandbox;
+pub mod vhost_user;
+
 use log::*;
 use passthrough::xattrmap::XattrMap;
 use std::collections::HashSet;
@@ -27,12 +30,13 @@ use virtiofsd::passthrough::{
     self, CachePolicy, InodeFileHandlesMode, MigrationMode, MigrationOnError, NegotiationMode,
     PassthroughFs,
 };
-use virtiofsd::sandbox::{Sandbox, SandboxMode};
 use virtiofsd::seccomp::{enable_seccomp, SeccompAction};
 use virtiofsd::util::write_pid_file;
-use virtiofsd::vhost_user::{Error, VhostUserFsBackendBuilder, MAX_TAG_LEN};
 use virtiofsd::{limits, oslib, soft_idmap};
 use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
+
+use self::sandbox::{Sandbox, SandboxMode};
+use self::vhost_user::{Error, VhostUserFsBackendBuilder, MAX_TAG_LEN};
 
 /// Maximum number of memory areas (slots) supported by the vhost-user-backend crate.
 ///

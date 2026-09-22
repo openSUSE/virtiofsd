@@ -19,6 +19,8 @@ use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+use vm_memory::bitmap::Bitmap;
 use vm_memory::ByteValued;
 
 const FUSE_BUFFER_HEADER_SIZE: u32 = 0x1000;
@@ -28,9 +30,9 @@ const DIRENT_PADDING: [u8; 8] = [0; 8];
 const CURRENT_DIR_CSTR: &[u8] = b".";
 const PARENT_DIR_CSTR: &[u8] = b"..";
 
-struct ZcReader<'a>(Reader<'a>);
+struct ZcReader<'a, B: Bitmap>(Reader<'a, B>);
 
-impl ZeroCopyReader for ZcReader<'_> {
+impl<'a, B: Bitmap + 'static> ZeroCopyReader for ZcReader<'a, B> {
     fn write_to_file_at(
         &mut self,
         f: &File,
@@ -57,9 +59,9 @@ impl ZeroCopyReader for ZcReader<'_> {
     }
 }
 
-struct ZcWriter<'a>(Writer<'a>);
+struct ZcWriter<'a, B: Bitmap>(Writer<'a, B>);
 
-impl ZeroCopyWriter for ZcWriter<'_> {
+impl<'a, B: Bitmap + 'static> ZeroCopyWriter for ZcWriter<'a, B> {
     fn read_from_file_at(
         &mut self,
         f: &File,
@@ -100,10 +102,10 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 
     #[allow(clippy::cognitive_complexity)]
-    pub fn handle_message<T>(
+    pub fn handle_message<T, B: Bitmap + 'static>(
         &self,
-        mut r: Reader,
-        w: Writer,
+        mut r: Reader<B>,
+        w: Writer<B>,
         vu_req: Option<&mut T>,
     ) -> Result<usize> {
         let in_header: InHeader = r.read_obj().map_err(Error::DecodeMessage)?;
@@ -185,11 +187,11 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn setupmapping<T>(
+    fn setupmapping<T, B: Bitmap + 'static>(
         &self,
         in_header: InHeader,
-        _r: Reader,
-        w: Writer,
+        _r: Reader<B>,
+        w: Writer<B>,
         _vu_req: Option<&mut T>,
     ) -> Result<usize> {
         reply_error(
@@ -199,11 +201,11 @@ impl<F: FileSystem + Sync> Server<F> {
         )
     }
 
-    fn removemapping<T>(
+    fn removemapping<T, B: Bitmap + 'static>(
         &self,
         in_header: InHeader,
-        _r: Reader,
-        w: Writer,
+        _r: Reader<B>,
+        w: Writer<B>,
         _vu_req: Option<&mut T>,
     ) -> Result<usize> {
         reply_error(
@@ -213,7 +215,12 @@ impl<F: FileSystem + Sync> Server<F> {
         )
     }
 
-    fn lookup(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn lookup<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let namelen = (in_header.len as usize)
             .checked_sub(size_of::<InHeader>())
             .ok_or(Error::InvalidHeaderLength)?;
@@ -237,7 +244,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn forget(&self, in_header: InHeader, mut r: Reader) -> Result<usize> {
+    fn forget<B: Bitmap + 'static>(&self, in_header: InHeader, mut r: Reader<B>) -> Result<usize> {
         let ForgetIn { nlookup } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         self.fs
@@ -247,7 +254,12 @@ impl<F: FileSystem + Sync> Server<F> {
         Ok(0)
     }
 
-    fn getattr(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn getattr<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let GetattrIn { flags, fh, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         let handle = if (flags & GETATTR_FH) != 0 {
@@ -273,7 +285,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn setattr(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn setattr<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let setattr_in: SetattrIn = r.read_obj().map_err(Error::DecodeMessage)?;
 
         let handle = if setattr_in.valid & FATTR_FH != 0 {
@@ -304,7 +321,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn readlink(&self, in_header: InHeader, w: Writer) -> Result<usize> {
+    fn readlink<B: Bitmap + 'static>(&self, in_header: InHeader, w: Writer<B>) -> Result<usize> {
         match self
             .fs
             .readlink(Context::from(in_header), in_header.nodeid.into())
@@ -317,7 +334,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn symlink(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn symlink<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         // Unfortunately the name and linkname are encoded one after another and
         // separated by a nul character.
         let len = (in_header.len as usize)
@@ -352,7 +374,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn mknod(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn mknod<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let MknodIn {
             mode, rdev, umask, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
@@ -389,7 +416,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn mkdir(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn mkdir<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let MkdirIn { mode, umask } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         let remaining_len = (in_header.len as usize)
@@ -423,7 +455,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn unlink(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn unlink<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let namelen = (in_header.len as usize)
             .checked_sub(size_of::<InHeader>())
             .ok_or(Error::InvalidHeaderLength)?;
@@ -441,7 +478,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn rmdir(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn rmdir<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let namelen = (in_header.len as usize)
             .checked_sub(size_of::<InHeader>())
             .ok_or(Error::InvalidHeaderLength)?;
@@ -459,14 +501,14 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn do_rename(
+    fn do_rename<B: Bitmap + 'static>(
         &self,
         in_header: InHeader,
         msg_size: usize,
         newdir: u64,
         flags: u32,
-        mut r: Reader,
-        w: Writer,
+        mut r: Reader<B>,
+        w: Writer<B>,
     ) -> Result<usize> {
         let buflen = (in_header.len as usize)
             .checked_sub(size_of::<InHeader>())
@@ -498,13 +540,23 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn rename(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn rename<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let RenameIn { newdir } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         self.do_rename(in_header, size_of::<RenameIn>(), newdir, 0, r, w)
     }
 
-    fn rename2(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn rename2<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let Rename2In { newdir, flags, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         let flags =
@@ -513,7 +565,12 @@ impl<F: FileSystem + Sync> Server<F> {
         self.do_rename(in_header, size_of::<Rename2In>(), newdir, flags, r, w)
     }
 
-    fn link(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn link<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let LinkIn { oldnodeid } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         let namelen = (in_header.len as usize)
@@ -539,7 +596,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn open(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn open<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let OpenIn {
             flags, open_flags, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
@@ -565,7 +627,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn read(&self, in_header: InHeader, mut r: Reader, mut w: Writer) -> Result<usize> {
+    fn read<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        mut w: Writer<B>,
+    ) -> Result<usize> {
         let ReadIn {
             fh,
             offset,
@@ -612,7 +679,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn write(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn write<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let WriteIn {
             fh,
             offset,
@@ -658,7 +730,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn statfs(&self, in_header: InHeader, w: Writer) -> Result<usize> {
+    fn statfs<B: Bitmap + 'static>(&self, in_header: InHeader, w: Writer<B>) -> Result<usize> {
         match self
             .fs
             .statfs(Context::from(in_header), in_header.nodeid.into())
@@ -668,7 +740,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn release(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn release<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let ReleaseIn {
             fh,
             flags,
@@ -698,7 +775,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn fsync(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn fsync<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let FsyncIn {
             fh, fsync_flags, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
@@ -715,7 +797,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn setxattr(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn setxattr<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let options = FsOptions::from_bits_truncate(self.options.load(Ordering::Relaxed));
         let (
             SetxattrIn {
@@ -778,7 +865,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn getxattr(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn getxattr<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let GetxattrIn { size, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         let namelen = (in_header.len as usize)
@@ -816,7 +908,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn listxattr(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn listxattr<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let GetxattrIn { size, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         if size > MAX_BUFFER_SIZE {
@@ -844,7 +941,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn removexattr(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn removexattr<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let namelen = (in_header.len as usize)
             .checked_sub(size_of::<InHeader>())
             .ok_or(Error::InvalidHeaderLength)?;
@@ -864,7 +966,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn flush(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn flush<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let FlushIn { fh, lock_owner, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         match self.fs.flush(
@@ -878,7 +985,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn init(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn init<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let InitInCompat {
             major,
             minor,
@@ -969,7 +1081,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn opendir(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn opendir<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let OpenIn { flags, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         match self
@@ -989,7 +1106,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn readdir(&self, in_header: InHeader, mut r: Reader, mut w: Writer) -> Result<usize> {
+    fn readdir<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        mut w: Writer<B>,
+    ) -> Result<usize> {
         let ReadIn {
             fh, offset, size, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
@@ -1080,7 +1202,12 @@ impl<F: FileSystem + Sync> Server<F> {
         Ok((dir_entry, entry))
     }
 
-    fn readdirplus(&self, in_header: InHeader, mut r: Reader, mut w: Writer) -> Result<usize> {
+    fn readdirplus<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        mut w: Writer<B>,
+    ) -> Result<usize> {
         let ReadIn {
             fh, offset, size, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
@@ -1166,7 +1293,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn releasedir(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn releasedir<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let ReleaseIn { fh, flags, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         match self.fs.releasedir(
@@ -1180,7 +1312,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn fsyncdir(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn fsyncdir<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let FsyncIn {
             fh, fsync_flags, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
@@ -1197,7 +1334,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn getlk(&self, in_header: InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
+    fn getlk<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut _r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         if let Err(e) = self.fs.getlk() {
             reply_error(e, in_header.unique, w)
         } else {
@@ -1205,7 +1347,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn setlk(&self, in_header: InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
+    fn setlk<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut _r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         if let Err(e) = self.fs.setlk() {
             reply_error(e, in_header.unique, w)
         } else {
@@ -1213,7 +1360,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn setlkw(&self, in_header: InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
+    fn setlkw<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut _r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         if let Err(e) = self.fs.setlkw() {
             reply_error(e, in_header.unique, w)
         } else {
@@ -1221,7 +1373,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn access(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn access<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let AccessIn { mask, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         match self
@@ -1233,7 +1390,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn create(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn create<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let CreateIn {
             flags,
             mode,
@@ -1293,7 +1455,12 @@ impl<F: FileSystem + Sync> Server<F> {
         0
     }
 
-    fn bmap(&self, in_header: InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
+    fn bmap<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut _r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         if let Err(e) = self.fs.bmap() {
             reply_error(e, in_header.unique, w)
         } else {
@@ -1311,7 +1478,12 @@ impl<F: FileSystem + Sync> Server<F> {
         0
     }
 
-    fn ioctl(&self, in_header: InHeader, _r: Reader, w: Writer) -> Result<usize> {
+    fn ioctl<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        _r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         if let Err(e) = self.fs.ioctl() {
             reply_error(e, in_header.unique, w)
         } else {
@@ -1319,7 +1491,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn poll(&self, in_header: InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
+    fn poll<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut _r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         if let Err(e) = self.fs.poll() {
             reply_error(e, in_header.unique, w)
         } else {
@@ -1327,7 +1504,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn notify_reply(&self, in_header: InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
+    fn notify_reply<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut _r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         if let Err(e) = self.fs.notify_reply() {
             reply_error(e, in_header.unique, w)
         } else {
@@ -1335,7 +1517,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn batch_forget(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn batch_forget<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let BatchForgetIn { count, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         if let Some(size) = (count as usize).checked_mul(size_of::<ForgetOne>()) {
@@ -1369,7 +1556,12 @@ impl<F: FileSystem + Sync> Server<F> {
         Ok(0)
     }
 
-    fn fallocate(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn fallocate<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let FallocateIn {
             fh,
             offset,
@@ -1391,7 +1583,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn lseek(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn lseek<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let LseekIn {
             fh, offset, whence, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
@@ -1412,7 +1609,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn copyfilerange(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn copyfilerange<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        mut r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let CopyfilerangeIn {
             fh_in,
             off_in,
@@ -1447,7 +1649,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn syncfs(&self, in_header: InHeader, w: Writer) -> Result<usize> {
+    fn syncfs<B: Bitmap + 'static>(&self, in_header: InHeader, w: Writer<B>) -> Result<usize> {
         match self
             .fs
             .syncfs(Context::from(in_header), in_header.nodeid.into())
@@ -1457,7 +1659,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn tmpfile(&self, in_header: InHeader, _r: Reader, w: Writer) -> Result<usize> {
+    fn tmpfile<B: Bitmap + 'static>(
+        &self,
+        in_header: InHeader,
+        _r: Reader<B>,
+        w: Writer<B>,
+    ) -> Result<usize> {
         let e = self
             .fs
             .tmpfile()
@@ -1481,7 +1688,7 @@ impl<F: FileSystem + SerializableFileSystem + Sync> SerializableFileSystem for S
     }
 }
 
-fn reply_readdir(len: usize, unique: u64, mut w: Writer) -> Result<usize> {
+fn reply_readdir<B: Bitmap + 'static>(len: usize, unique: u64, mut w: Writer<B>) -> Result<usize> {
     let out = OutHeader {
         len: (size_of::<OutHeader>() + len) as u32,
         error: 0,
@@ -1494,11 +1701,11 @@ fn reply_readdir(len: usize, unique: u64, mut w: Writer) -> Result<usize> {
     Ok(out.len as usize)
 }
 
-fn reply_ok<T: ByteValued>(
+fn reply_ok<T: ByteValued, B: Bitmap + 'static>(
     out: Option<T>,
     data: Option<&[u8]>,
     unique: u64,
-    mut w: Writer,
+    mut w: Writer<B>,
 ) -> Result<usize> {
     let mut len = size_of::<OutHeader>();
 
@@ -1548,7 +1755,7 @@ fn strerror(error: i32) -> String {
     String::from_utf8(err_desc.to_vec()).unwrap_or_else(|_| "".to_owned())
 }
 
-fn reply_error(e: io::Error, unique: u64, mut w: Writer) -> Result<usize> {
+fn reply_error<B: Bitmap + 'static>(e: io::Error, unique: u64, mut w: Writer<B>) -> Result<usize> {
     let header = OutHeader {
         len: size_of::<OutHeader>() as u32,
         error: -e.raw_os_error().unwrap_or(libc::EIO),
@@ -1576,8 +1783,8 @@ fn bytes_to_cstr(buf: &[u8]) -> Result<&CStr> {
     CStr::from_bytes_with_nul(buf).map_err(Error::InvalidCString)
 }
 
-fn add_dirent(
-    cursor: &mut Writer,
+fn add_dirent<B: Bitmap>(
+    cursor: &mut Writer<B>,
     max: usize,
     d: DirEntry,
     entry: Option<Entry>,

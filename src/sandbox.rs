@@ -2,8 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use crate::{idmap, oslib, passthrough, util};
-use idmap::{GidMap, IdMapSetUpPipeMessage, UidMap};
+use crate::{oslib, passthrough};
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -14,6 +13,9 @@ use std::process::{self, Command};
 use std::str::FromStr;
 use std::{error, fmt, io};
 use vhost::vhost_user::Listener;
+
+use virtiofsd::idmap::{GidMap, UidMap};
+use virtiofsd::util;
 
 #[derive(Debug)]
 pub enum Error {
@@ -122,6 +124,13 @@ impl fmt::Display for Error {
             _ => write!(f, "{self:?}"),
         }
     }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum IdMapSetUpPipeMessage {
+    Request = 0x1,
+    Done = 0x2,
 }
 
 /// Mechanism to be used for setting up the sandbox.
@@ -267,8 +276,8 @@ impl Sandbox {
         oslib::fchdir(newroot.as_raw_fd()).map_err(Error::ChdirNewRoot)?;
 
         // Check if we are supposed to switch to our current rootfs
-        let old_st = passthrough::statx(&oldroot_fd, None).map_err(Error::StatOldRoot)?;
-        let new_st = passthrough::statx(&newroot, None).map_err(Error::StatNewRoot)?;
+        let old_st = passthrough::stat::statx(&oldroot_fd, None).map_err(Error::StatOldRoot)?;
+        let new_st = passthrough::stat::statx(&newroot, None).map_err(Error::StatNewRoot)?;
         let switch_to_current_rootfs = (old_st.mnt_id == new_st.mnt_id)
             && (old_st.st.st_dev == new_st.st.st_dev)
             && (old_st.st.st_ino == new_st.st.st_ino);
@@ -454,7 +463,7 @@ impl Sandbox {
                     // other end of the pipe.
                     drop(x_reader);
                     drop(y_writer);
-                    error!("sandbox: couldn't setup id mappings: {error}");
+                    log::error!("sandbox: couldn't setup id mappings: {error}");
                     process::exit(1);
                 };
             }
@@ -496,11 +505,11 @@ impl Sandbox {
             // Set the process inside the user namespace as root
             let mut ret = unsafe { libc::setresuid(0, 0, 0) };
             if ret != 0 {
-                warn!("Couldn't set the process uid as root: {ret}");
+                log::warn!("Couldn't set the process uid as root: {ret}");
             }
             ret = unsafe { libc::setresgid(0, 0, 0) };
             if ret != 0 {
-                warn!("Couldn't set the process gid as root: {ret}");
+                log::warn!("Couldn't set the process gid as root: {ret}");
             }
 
             let child = util::sfork().map_err(Error::Fork)?;
@@ -638,7 +647,7 @@ impl Sandbox {
         let must_drop_supplemental_groups = match self.must_drop_supplemental_groups() {
             Ok(must_drop) => must_drop,
             Err(error) => {
-                warn!(
+                log::warn!(
                     "Failed to determine whether supplemental groups must be dropped: {error}; \
                     defaulting to trying to drop supplemental groups"
                 );

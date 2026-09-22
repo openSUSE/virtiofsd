@@ -12,35 +12,37 @@ readme = "README.md"
 exclude = [".gitlab-ci.yml"]
 
 [features]
-default = ["seccomp"]
+default = ["seccomp", "daemon"]
 # Expose seccomp bindings from the library.
 seccomp = ["dep:libseccomp-sys"]
 # Enabling Xen support will _disable_ QEMU/KVM support!
-xen = ["vhost-user-backend/xen", "vhost/xen", "vm-memory/xen"]
+xen = ["vhost-user-backend?/xen", "vhost?/xen", "vm-memory/xen"]
+# Enable daemon binary and CLI/vhost-user dependencies.
+daemon = ["dep:vhost-user-backend", "dep:vhost", "dep:clap", "dep:syslog", "dep:env_logger", "dep:futures", "dep:virtio-bindings"]
 
 [[bin]]
 name = "virtiofsd"
-required-features = ["seccomp"]
+required-features = ["seccomp", "daemon"]
 
 [dependencies]
 bitflags = "1.2"
 btree-range-map = "0.7"
 capng = "0.2.2"
-env_logger = "0.8.4"
-futures = { version = "0.3", features = ["thread-pool"] }
+env_logger = { version = "0.8.4", optional = true }
+futures = { version = "0.3", features = ["thread-pool"], optional = true }
 libc = "0.2.177"
 log = "0.4"
 libseccomp-sys = { version = "0.2", optional = true }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
 postcard = { version = "1.0", features = ["use-std"] }
 serde = { version = "1.0", features = ["derive"] }
-vhost-user-backend = "0.22"
-vhost = "0.16"
-virtio-bindings = "0.2.7"
+vhost-user-backend = { version = "0.22", optional = true }
+vhost = { version = "0.16", optional = true }
+virtio-bindings = { version = "0.2.7", optional = true }
 vm-memory = { version = "=0.17.1", features = ["backend-mmap", "backend-atomic"] }
 virtio-queue = "0.17.0"
 vmm-sys-util = "0.15.0"
-syslog = "6.1"
+syslog = { version = "6.1", optional = true }
 
 [profile.release]
 lto = true

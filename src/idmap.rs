@@ -121,10 +121,3 @@ fn parse_idmap(s: &str, expected_len: usize) -> Result<Vec<u32>, IdMapError> {
         .map(|v| v.parse().map_err(IdMapError::InvalidValue))
         .collect()
 }
-
-#[derive(Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub(crate) enum IdMapSetUpPipeMessage {
-    Request = 0x1,
-    Done = 0x2,
-}
