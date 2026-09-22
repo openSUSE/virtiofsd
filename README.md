@@ -35,6 +35,8 @@ After installing Rust, you can compile it to a binary by running:
 cargo build --release
 ```
 
+For development without installing host build dependencies, see the [container workflow](tools/README.md).
+
 ## CI-built binaries
 
 Every time new code is merged, the CI pipeline will upload a debug binary
