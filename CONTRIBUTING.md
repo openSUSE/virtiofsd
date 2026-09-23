@@ -62,7 +62,8 @@ If you have a problem, please let us know. We recommend using
 [gitlab issues](https://gitlab.com/virtio-fs/virtiofsd/-/issues/new) for formally
 reporting and documenting them.
 
-You can also contact us via email through the [virtio-fs mailing list](https://www.redhat.com/mailman/listinfo/virtio-fs).
+You can also contact us via email through the
+[virtio-fs mailing list](mailto:virtio-fs@lists.linux.dev) ([list info](https://lists.linux.dev/)).
 
 ## Closing issues
 
