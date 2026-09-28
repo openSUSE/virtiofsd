@@ -181,6 +181,11 @@ impl Sandbox {
         }
     }
 
+    // Return whether this sandbox
+    pub fn is_none(&self) -> bool {
+        self.sandbox_mode == SandboxMode::None
+    }
+
     // Make `self.shared_dir` our root directory, and get isolated file descriptors for
     // `/proc/self/fd` and '/proc/self/mountinfo`.
     //
