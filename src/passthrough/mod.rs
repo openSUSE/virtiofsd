@@ -1578,6 +1578,7 @@ impl FileSystem for PassthroughFs {
     type Handle = Handle;
     type DirIter = ReadDir<Vec<u8>>;
 
+    #[instrument(level = "trace", skip(self), ret)]
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
         // Force-wipe prior state in case someone "forgot" to send a DESTROY
         self.destroy();
@@ -1656,6 +1657,7 @@ impl FileSystem for PassthroughFs {
         Ok(opts)
     }
 
+    #[instrument(level = "trace", skip(self))]
     fn destroy(&self) {
         self.handles.write().unwrap().clear();
         self.inodes.clear();
@@ -1665,6 +1667,7 @@ impl FileSystem for PassthroughFs {
         self.sup_group_extension.store(false, Ordering::Relaxed);
     }
 
+    #[instrument(level = "trace", skip(self, _ctx), ret)]
     fn statfs(&self, _ctx: Context, inode: Inode) -> io::Result<libc::statvfs64> {
         let data = self.inodes.get(inode).ok_or_else(ebadf)?;
         let inode_file = data.get_file()?;
@@ -1680,18 +1683,22 @@ impl FileSystem for PassthroughFs {
         }
     }
 
+    #[instrument(level = "trace", skip(self, _ctx), ret)]
     fn lookup(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
         self.do_lookup(parent, name)
     }
 
+    #[instrument(level = "trace", skip(self, _ctx))]
     fn forget(&self, _ctx: Context, inode: Inode, count: u64) {
         self.inodes.forget_one(inode, count)
     }
 
+    #[instrument(level = "trace", skip(self, _ctx))]
     fn batch_forget(&self, _ctx: Context, requests: Vec<(Inode, u64)>) {
         self.inodes.forget_many(requests)
     }
 
+    #[instrument(level = "trace", skip(self, _ctx), ret)]
     fn opendir(
         &self,
         _ctx: Context,
@@ -1701,6 +1708,7 @@ impl FileSystem for PassthroughFs {
         self.do_open(inode, false, flags | (libc::O_DIRECTORY as u32))
     }
 
+    #[instrument(level = "trace", skip(self, _ctx, _flags), err)]
     fn releasedir(
         &self,
         _ctx: Context,
@@ -1711,6 +1719,7 @@ impl FileSystem for PassthroughFs {
         self.do_release(inode, handle)
     }
 
+    #[instrument(level = "trace", skip(self), ret)]
     fn mkdir(
         &self,
         ctx: Context,
@@ -1754,10 +1763,12 @@ impl FileSystem for PassthroughFs {
         self.do_lookup(parent, name)
     }
 
+    #[instrument(level = "trace", skip(self, _ctx), err)]
     fn rmdir(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
         self.do_unlink(parent, name, libc::AT_REMOVEDIR)
     }
 
+    #[instrument(level = "trace", skip(self, _ctx), ret)]
     fn readdir(
         &self,
         _ctx: Context,
@@ -1782,6 +1793,7 @@ impl FileSystem for PassthroughFs {
         ReadDir::new(&*dir, offset, buf)
     }
 
+    #[instrument(level = "trace", skip(self, _ctx), ret)]
     fn open(
         &self,
         _ctx: Context,
@@ -1792,6 +1804,7 @@ impl FileSystem for PassthroughFs {
         self.do_open(inode, kill_priv, flags)
     }
 
+    #[instrument(level = "trace", skip_all, fields(inode, handle), err)]
     fn release(
         &self,
         _ctx: Context,
@@ -1805,6 +1818,7 @@ impl FileSystem for PassthroughFs {
         self.do_release(inode, handle)
     }
 
+    #[instrument(level = "trace", skip(self), ret)]
     fn create(
         &self,
         ctx: Context,
@@ -1882,10 +1896,12 @@ impl FileSystem for PassthroughFs {
         Ok((entry, Some(handle), opts))
     }
 
+    #[instrument(level = "trace", skip(self, _ctx), err)]
     fn unlink(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
         self.do_unlink(parent, name, 0)
     }
 
+    #[instrument(level = "trace", skip(self, _ctx, w, _lock_owner, _flags), ret)]
     fn read<W: ZeroCopyWriter>(
         &self,
         _ctx: Context,
@@ -1905,6 +1921,7 @@ impl FileSystem for PassthroughFs {
         w.read_from_file_at(f.get_file(), size as usize, offset, None)
     }
 
+    #[instrument(level = "trace", skip(self, _ctx, r, _lock_owner), ret)]
     fn write<R: ZeroCopyReader>(
         &self,
         _ctx: Context,
@@ -1948,6 +1965,7 @@ impl FileSystem for PassthroughFs {
         }
     }
 
+    #[instrument(level = "trace", skip(self, _ctx, _handle), ret)]
     fn getattr(
         &self,
         _ctx: Context,
@@ -1957,6 +1975,7 @@ impl FileSystem for PassthroughFs {
         self.do_getattr(inode)
     }
 
+    #[instrument(level = "trace", skip(self, _ctx), ret)]
     fn setattr(
         &self,
         _ctx: Context,
@@ -2111,6 +2130,7 @@ impl FileSystem for PassthroughFs {
         self.do_getattr(inode)
     }
 
+    #[instrument(level = "trace", skip(self, _ctx), err)]
     fn rename(
         &self,
         _ctx: Context,
@@ -2157,6 +2177,7 @@ impl FileSystem for PassthroughFs {
         Ok(())
     }
 
+    #[instrument(level = "trace", skip(self), ret)]
     fn mknod(
         &self,
         ctx: Context,
@@ -2208,6 +2229,7 @@ impl FileSystem for PassthroughFs {
         self.do_lookup(parent, name)
     }
 
+    #[instrument(level = "trace", skip(self, _ctx), ret)]
     fn link(
         &self,
         _ctx: Context,
@@ -2245,6 +2267,7 @@ impl FileSystem for PassthroughFs {
         }
     }
 
+    #[instrument(level = "trace", skip(self), ret)]
     fn symlink(
         &self,
         ctx: Context,
@@ -2284,6 +2307,7 @@ impl FileSystem for PassthroughFs {
         self.do_lookup(parent, name)
     }
 
+    #[instrument(level = "trace", skip(self, _ctx), ret)]
     fn readlink(&self, _ctx: Context, inode: Inode) -> io::Result<Vec<u8>> {
         let data = self.inodes.get(inode).ok_or_else(ebadf)?;
         let inode_file = data.get_file()?;
@@ -2310,6 +2334,7 @@ impl FileSystem for PassthroughFs {
         Ok(buf)
     }
 
+    #[instrument(level = "trace", skip(self, _ctx, _lock_owner), err)]
     fn flush(
         &self,
         _ctx: Context,
@@ -2336,6 +2361,7 @@ impl FileSystem for PassthroughFs {
         }
     }
 
+    #[instrument(level = "trace", skip(self, _ctx), err)]
     fn fsync(&self, _ctx: Context, inode: Inode, datasync: bool, handle: Handle) -> io::Result<()> {
         let data = self.find_handle(handle, inode)?;
 
@@ -2357,6 +2383,7 @@ impl FileSystem for PassthroughFs {
         }
     }
 
+    #[instrument(level = "trace", skip(self), err)]
     fn fsyncdir(
         &self,
         ctx: Context,
@@ -2367,6 +2394,7 @@ impl FileSystem for PassthroughFs {
         self.fsync(ctx, inode, datasync, handle)
     }
 
+    #[instrument(level = "trace", skip(self), err)]
     fn access(&self, ctx: Context, inode: Inode, mask: u32) -> io::Result<()> {
         let data = self.inodes.get(inode).ok_or_else(ebadf)?;
         let inode_file = data.get_file()?;
@@ -2420,6 +2448,7 @@ impl FileSystem for PassthroughFs {
         Ok(())
     }
 
+    #[instrument(level = "trace", skip(self, _ctx), err)]
     fn setxattr(
         &self,
         _ctx: Context,
@@ -2500,6 +2529,7 @@ impl FileSystem for PassthroughFs {
         }
     }
 
+    #[instrument(level = "trace", skip(self, _ctx), ret)]
     fn getxattr(
         &self,
         _ctx: Context,
@@ -2567,6 +2597,7 @@ impl FileSystem for PassthroughFs {
         }
     }
 
+    #[instrument(level = "trace", skip(self, _ctx), ret)]
     fn listxattr(&self, _ctx: Context, inode: Inode, size: u32) -> io::Result<ListxattrReply> {
         if !self.cfg.xattr {
             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
@@ -2618,6 +2649,7 @@ impl FileSystem for PassthroughFs {
         }
     }
 
+    #[instrument(level = "trace", skip(self, _ctx), err)]
     fn removexattr(&self, _ctx: Context, inode: Inode, name: &CStr) -> io::Result<()> {
         if !self.cfg.xattr {
             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
@@ -2652,6 +2684,7 @@ impl FileSystem for PassthroughFs {
         }
     }
 
+    #[instrument(level = "trace", skip(self, _ctx), err)]
     fn fallocate(
         &self,
         _ctx: Context,
@@ -2680,6 +2713,7 @@ impl FileSystem for PassthroughFs {
         }
     }
 
+    #[instrument(level = "trace", skip(self, _ctx), ret)]
     fn lseek(
         &self,
         _ctx: Context,
@@ -2701,6 +2735,7 @@ impl FileSystem for PassthroughFs {
         }
     }
 
+    #[instrument(level = "trace", skip(self, _ctx), ret)]
     fn copyfilerange(
         &self,
         _ctx: Context,
@@ -2743,6 +2778,7 @@ impl FileSystem for PassthroughFs {
         }
     }
 
+    #[instrument(level = "trace", skip(self, _ctx), err)]
     fn syncfs(&self, _ctx: Context, inode: Inode) -> io::Result<()> {
         // TODO: Branch here depending on whether virtiofsd announces submounts or not.
 

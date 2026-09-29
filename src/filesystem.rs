@@ -15,6 +15,7 @@ use crate::{fuse, oslib};
 pub use fuse::{FsOptions, OpenOptions, RemovemappingOne, SetattrValid, SetxattrFlags, ROOT_ID};
 
 /// Information about a path in the filesystem.
+#[derive(Debug)]
 pub struct Entry {
     /// An `Inode` that uniquely identifies this path. During `lookup`, setting this to `0` means a
     /// negative entry. Returning `ENOENT` also means a negative entry but setting this to `0`
@@ -80,6 +81,7 @@ pub struct DirEntry<'a> {
 }
 
 /// A reply to a `getxattr` method call.
+#[derive(Debug)]
 pub enum GetxattrReply {
     /// The value of the requested extended attribute. This can be arbitrary textual or binary data
     /// and does not need to be nul-terminated.
@@ -93,6 +95,7 @@ pub enum GetxattrReply {
 }
 
 /// A reply to a `listxattr` method call.
+#[derive(Debug)]
 pub enum ListxattrReply {
     /// A buffer containing a nul-separated list of the names of all the extended attributes
     /// associated with this `Inode`. This list of names may be unordered and includes a namespace

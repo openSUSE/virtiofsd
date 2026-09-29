@@ -2,7 +2,8 @@
 //
 // SPDX-License-Identifier: (Apache-2.0 AND BSD-3-Clause)
 
-use log::*;
+mod logging;
+
 use passthrough::xattrmap::XattrMap;
 use std::collections::HashSet;
 use std::convert::TryFrom;
@@ -12,7 +13,8 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use std::{cmp, env, process};
+use std::{cmp, process};
+use tracing::{error, info, warn};
 use virtiofsd::idmap::{GidMap, UidMap};
 
 use clap::{CommandFactory, Parser};
@@ -239,9 +241,9 @@ struct Opt {
     #[arg(long)]
     modcaps: Option<String>,
 
-    /// Log level (error, warn, info, debug, trace, off)
-    #[arg(long = "log-level", default_value = "info")]
-    log_level: LevelFilter,
+    /// Log level or tracing filter directive (error, warn, info, debug, trace, off)
+    #[arg(long = "log-level", default_value = "info", value_parser = logging::parse_log_level)]
+    log_level: String,
 
     /// Log to syslog [default: stderr]
     #[arg(long)]
@@ -450,10 +452,8 @@ fn parse_compat(opt: Opt) -> Opt {
                 _ => value_error("cache", value),
             },
             ["loglevel", value] => match value {
-                "debug" => opt.log_level = LevelFilter::Debug,
-                "info" => opt.log_level = LevelFilter::Info,
-                "warn" => opt.log_level = LevelFilter::Warn,
-                "err" => opt.log_level = LevelFilter::Error,
+                "debug" | "info" | "warn" => opt.log_level = value.to_string(),
+                "err" => opt.log_level = "error".to_string(),
                 _ => value_error("loglevel", value),
             },
             ["sandbox", value] => match value {
@@ -516,30 +516,6 @@ fn print_capabilities() {
     println!("    \"separate-options\"");
     println!("  ]");
     println!("}}");
-}
-
-fn set_default_logger(log_level: LevelFilter) {
-    if env::var("RUST_LOG").is_err() {
-        env::set_var("RUST_LOG", log_level.to_string());
-    }
-    env_logger::init();
-}
-
-fn initialize_logging(opt: &Opt) {
-    let log_level = if opt.compat_debug {
-        LevelFilter::Debug
-    } else {
-        opt.log_level
-    };
-
-    if opt.syslog {
-        if let Err(e) = syslog::init(syslog::Facility::LOG_USER, log_level, None) {
-            set_default_logger(log_level);
-            warn!("can't enable syslog: {e}");
-        }
-    } else {
-        set_default_logger(log_level);
-    }
 }
 
 fn set_signal_handlers() {
@@ -651,7 +627,7 @@ fn main() {
         return;
     }
 
-    initialize_logging(&opt);
+    logging::initialize_logging(&opt);
     set_signal_handlers();
 
     let shared_dir = match opt.shared_dir.as_ref() {

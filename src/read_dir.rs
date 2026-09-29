@@ -9,8 +9,6 @@ use std::mem::size_of;
 use std::ops::{Deref, DerefMut};
 use std::os::unix::io::AsRawFd;
 
-use log::debug;
-
 use vm_memory::ByteValued;
 
 #[repr(C, packed)]
@@ -23,7 +21,7 @@ struct LinuxDirent64 {
 }
 unsafe impl ByteValued for LinuxDirent64 {}
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct ReadDir<P> {
     buf: P,
     current: usize,
